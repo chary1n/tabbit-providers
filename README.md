@@ -10,7 +10,9 @@ other provider, with the account's allowance, fallbacks and usage card.
 ## Install
 
 ```sh
-magpie plugin add npm:magpie-tabbit-provider     # from this folder: magpie plugin add ./tabbit_providers
+magpie plugin add npm:magpie-tabbit-provider     # npm (published)
+# or from source:  magpie plugin add github:chary1n/tabbit-providers
+# or from this folder: magpie plugin add ./tabbit_providers
 magpie plugin login tabbit                       # pick “Read Tabbit Browser sign-in (macOS)”
 magpie provider test tabbit                      # ✓ chat · Default
 ```

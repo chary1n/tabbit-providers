@@ -32,6 +32,14 @@ publish/
 |---|---|---|
 | 0.1.0 | 2026-11-03 | ✅ 已上线（`latest`），`npm i magpie-tabbit-provider` 可用 |
 
+已落地的分发入口：
+
+| 入口 | 地址 | 状态 |
+|---|---|---|
+| npm | https://www.npmjs.com/package/magpie-tabbit-provider | ✅ 0.1.0 是 `latest` |
+| GitHub 源码仓库（`github:` 安装） | https://github.com/chary1n/tabbit-providers | ✅ public，topics 含 `magpie-plugin` |
+| 社区仓 PR（进「发现 → 推荐列表」） | https://github.com/magpie-community/plugins/pull/673 | ⏳ open，等 review |
+
 实测踩到的两件事，下次发版直接照做：
 
 1. **首次发布会先出现 `0.0.0-stage` 占位版本**（npm 的暂存发布流程，占名用）。真实版本批准
