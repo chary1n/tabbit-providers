@@ -22,7 +22,6 @@
 import {
   credsOf,
   expiresAt,
-  stale,
   listModels,
   usage as readUsage,
   createRoom,
@@ -41,11 +40,20 @@ const NAME = "Tabbit"
 const SESSION = "x-magpie-tabbit-session"
 const FREE_ONLY = "freeOnly"
 const ROOM_TTL = 30 * 60 * 1000
+// A cap as well as the TTL: a process that runs for days sees many sessions,
+// and the map must not grow with them. Oldest goes first.
+const ROOM_LIMIT = 256
 
 // Rooms are this process's memory of a magpie session, one per session id.
 // They are not persisted: a restart starts new rooms, which costs nothing
 // because a room whose transcript no longer matters is simply abandoned.
 const rooms = new Map()
+
+// pruneRooms drops what is past its TTL and then the oldest beyond the cap.
+function pruneRooms(now = Date.now()) {
+  for (const [k, entry] of rooms) if (now - entry.at >= ROOM_TTL) rooms.delete(k)
+  while (rooms.size > ROOM_LIMIT) rooms.delete(rooms.keys().next().value)
+}
 
 const clean = (v) => (typeof v === "string" ? v.trim() : "")
 
@@ -190,14 +198,19 @@ function completionBody(model, text, reasoning, usage) {
   }
 }
 
-// errorResponse carries the sign-in state magpie reads: `X-Magpie-Sign-In:
-// expired` marks the account, and a 403 with code 492 leaves it alone (the
-// model isn't on the plan; the sign-in is fine).
+// Statuses magpie reads for itself: a 400/404 is the request's fault, a 429
+// says wait, 401 marks the account, and 403 with code 492 is a paywall the
+// account survives. Anything else is a gateway failure and goes as 502.
+const PASS_THROUGH = new Set([400, 401, 403, 404, 429])
+
+// errorResponse carries the sign-in state magpie reads (`X-Magpie-Sign-In:
+// expired` on a 401) and Tabbit's `retry-after` on a 429.
 function errorResponse(error) {
   const status = Number.isFinite(error?.status) ? error.status : 500
   const headers = { "content-type": "application/json" }
   if (error?.signIn) headers["x-magpie-sign-in"] = error.signIn
-  const passthrough = status === 401 || status === 403
+  if (error?.retryAfter) headers["retry-after"] = String(error.retryAfter)
+  const passthrough = PASS_THROUGH.has(status)
   return new Response(
     JSON.stringify({
       error: {
@@ -215,19 +228,33 @@ function errorResponse(error) {
 // producing for a while otherwise, and the account pays for it.
 function streamTurn(response, { model, plan, body, signal, onEnd, onCancel }) {
   const encoder = new TextEncoder()
+  const stopReading = new AbortController()
   return new ReadableStream({
     async start(controller) {
-      const send = (text) => controller.enqueue(encoder.encode(text))
+      const send = (text) => {
+        try {
+          controller.enqueue(encoder.encode(text))
+        } catch {
+          /* the reader went away */
+        }
+      }
       let text = ""
       try {
         send(chunkLine(model, { role: "assistant", content: "" }))
-        for await (const part of turnDeltas(response, { signal })) {
+        for await (const part of turnDeltas(response, { signal: signal ? AbortSignal.any([signal, stopReading.signal]) : stopReading.signal })) {
           if (part.type === "thinking" && part.value) send(chunkLine(model, { reasoning_content: part.value }))
           else if (part.type === "text" && part.value) {
             text += part.value
             send(chunkLine(model, { content: part.value }))
           } else if (part.type === "end") {
             if (part.state.failed) throw new TabbitError(`Tabbit's turn failed: ${JSON.stringify(part.state.failed).slice(0, 300)}`)
+            if (part.state.truncated) {
+              // The turn never finished. An empty or half answer reported as
+              // `stop` would be taken as the answer; this says it is not.
+              send(`data: ${JSON.stringify({ error: { message: "Tabbit's turn ended without finishing", type: "tabbit_error" } })}\n\n`)
+              send("data: [DONE]\n\n")
+              return
+            }
             const usage = body?.stream_options?.include_usage
               ? {
                   prompt_tokens: estimateTokens(plan.content),
@@ -254,6 +281,10 @@ function streamTurn(response, { model, plan, body, signal, onEnd, onCancel }) {
       }
     },
     async cancel() {
+      // Stop reading the stream, then tell Tabbit to end the run: leaving it
+      // producing would spend the account's allowance for an answer nobody
+      // will read.
+      stopReading.abort(new Error("cancelled"))
       try {
         await onCancel?.()
       } catch {
@@ -278,7 +309,12 @@ function createPlugin() {
     if (!creds) throw Object.assign(new TabbitError("tabbit: not signed in", { status: 401 }), { signIn: "expired" })
 
     const session = sessionOf(request.headers)
-    const plan = planTurn(rooms.get(session), messages)
+    // The account is part of the key: magpie may send a session's next request
+    // on another account, and continuing that account's room would either be
+    // refused (403 → marked signed out) or answered by someone else's room.
+    const account = creds.uid || "?"
+    const roomKey = session ? `${account}\u0000${session}` : ""
+    const plan = planTurn(rooms.get(roomKey), messages)
 
     const start = async (roomId, parentMessageId) => {
       await runTurn(creds, roomId, { content: plan.content, model, parentMessageId, signal: request.signal })
@@ -309,8 +345,8 @@ function createPlugin() {
         plan,
         body,
         signal: request.signal,
-        onEnd: (state) => remember(session, room, plan.history, state?.assistantMessageId ?? null),
-        onCancel: () => stop(creds, room, request.signal),
+        onEnd: (state) => remember(roomKey, room, plan.history, state?.assistantMessageId ?? null),
+        onCancel: () => stop(creds, room),
       })
       return new Response(stream, {
         status: 200,
@@ -331,7 +367,7 @@ function createPlugin() {
         if (part.state.truncated) throw new TabbitError("Tabbit's turn was cut before it finished")
       }
     }
-    remember(session, room, plan.history, assistantId)
+    remember(roomKey, room, plan.history, assistantId)
     return Response.json(
       completionBody(model, text, reasoning, {
         prompt_tokens: estimateTokens(plan.content),
@@ -341,10 +377,12 @@ function createPlugin() {
     )
   }
 
-  function remember(session, room, history, parent) {
-    if (!session) return
-    rooms.set(session, { room, parent, sent: history, at: Date.now() })
+  function remember(key, room, history, parent) {
+    if (!key) return
+    pruneRooms()
+    rooms.set(key, { room, parent, sent: history, at: Date.now() })
   }
+
 
   return {
     async config(cfg) {
@@ -391,11 +429,11 @@ function createPlugin() {
           apiKey: "",
           async fetch(input, init) {
             const request = new Request(input, init)
-            const path = new URL(request.url).pathname
-            if (request.method !== "POST" || !path.endsWith("/chat/completions")) {
-              throw new TabbitError(`tabbit: ${request.method} ${path} is not served by this provider`, { status: 404 })
-            }
             try {
+              const path = new URL(request.url).pathname
+              if (request.method !== "POST" || !path.endsWith("/chat/completions")) {
+                throw new TabbitError(`tabbit: ${request.method} ${path} is not served by this provider`, { status: 404 })
+              }
               return await chat(getAuth, request)
             } catch (error) {
               return errorResponse(error)
@@ -467,7 +505,6 @@ function createPlugin() {
             windows: [usageWindow(data)],
             ...(auth?.metadata?.userId || creds.uid ? { accountId: auth?.metadata?.userId || creds.uid } : {}),
             ...(expiresAt(auth) ? { expiresAt: expiresAt(auth) } : {}),
-            ...(stale(auth) ? { error: "This sign-in has expired; read it again", signIn: "expired" } : {}),
           }
         } catch (error) {
           return { error: error?.message ?? String(error), signIn: error?.signIn, windows: [] }
@@ -491,5 +528,6 @@ export const _internal = {
   usageWindow,
   parseCycleDate,
   estimateTokens,
+  pruneRooms,
   rooms,
 }

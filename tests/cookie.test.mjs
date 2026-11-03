@@ -7,7 +7,7 @@ import crypto from "node:crypto"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { decryptValue, cookieStore, copyStore, profileDirs, readCookies } from "../src/cookie.mjs"
+import { decryptValue, cookieStore, copyStore, profileDirs, readCookies, desktopSignIn } from "../src/cookie.mjs"
 
 const HOST = "web.tabbit.com"
 const PASSWORD = "test-password"
@@ -85,4 +85,46 @@ test("readCookies reads token and user_id back out of a real sqlite file", () =>
   const token = rows.find((r) => r.name === "token")
   assert.equal(decryptValue(token.encrypted, { password: PASSWORD }), "tok-123")
   assert.equal(rows.find((r) => r.name === "user_id").value, "u-1")
+})
+
+// ---- review round: the temp copy must not survive a sign-in ---------------
+
+function storeWith(token) {
+  let DatabaseSync
+  try {
+    DatabaseSync = globalThis.process.getBuiltinModule("node:sqlite").DatabaseSync
+  } catch {
+    return null
+  }
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tabbit-store-"))
+  const file = path.join(root, "Cookies")
+  const db = new DatabaseSync(file)
+  db.exec("create table cookies(host_key text, name text, value text, encrypted_value blob)")
+  if (token) db.prepare("insert into cookies values (?,?,?,?)").run(HOST, "token", "", seal(token))
+  db.prepare("insert into cookies values (?,?,?,?)").run(HOST, "user_id", "u-9", Buffer.alloc(0))
+  db.close()
+  return file
+}
+
+test("a successful desktop sign-in leaves no copy of the cookie store", () => {
+  const file = storeWith("tok-desktop")
+  if (!file) return
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "tabbit-parent-"))
+  const sign = desktopSignIn({ store: file, password: PASSWORD, tmpParent: parent, platform: "darwin" })
+  assert.match(sign.key, /token=tok-desktop/)
+  assert.equal(sign.userId, "u-9")
+  assert.deepEqual(fs.readdirSync(parent), [])
+})
+
+test("a failed desktop sign-in leaves no copy either", () => {
+  const file = storeWith(null)
+  if (!file) return
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "tabbit-parent-"))
+  assert.throws(() => desktopSignIn({ store: file, password: PASSWORD, tmpParent: parent, platform: "darwin" }), /not signed in/)
+  assert.deepEqual(fs.readdirSync(parent), [])
+})
+
+test("the desktop method is macOS-only, and says so elsewhere", () => {
+  assert.throws(() => desktopSignIn({ store: "/nonexistent/Cookies", platform: "linux" }), /macOS-only/)
+  assert.throws(() => desktopSignIn({ store: "/nonexistent/Cookies", platform: "win32" }), /macOS-only/)
 })

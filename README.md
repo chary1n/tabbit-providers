@@ -10,11 +10,10 @@ other provider, with the account's allowance, fallbacks and usage card.
 ## Install
 
 ```sh
-magpie plugin add npm:magpie-tabbit-provider     # npm (published)
-# or from source:  magpie plugin add github:chary1n/tabbit-providers
-# or from this folder: magpie plugin add ./tabbit_providers
-magpie plugin login tabbit                       # pick “Read Tabbit Browser sign-in (macOS)”
-magpie provider test tabbit                      # ✓ chat · Default
+magpie plugin add @magpie-community/opencode-tabbit-auth   # from the community list
+# from this source tree instead:   magpie plugin add .
+magpie plugin login tabbit                                 # pick “Read Tabbit Browser sign-in (macOS)”
+magpie provider test tabbit                                # ✓ chat · Default
 ```
 
 Then pick `tabbit/<model>` in any agent's model row on magpie's Agents page —
@@ -28,7 +27,7 @@ magpie group add tabbit-pool models=tabbit/Default,tabbit/DeepSeek-V4.1-Flash ro
 标签条最右的 **插件** → 「Tabbit · 每日自动签到」打开开关（还有「立即签到」按钮）。
 Tabbit 的签到就是桌面宠物那个活动，结果会画在用量卡片上。
 
-**OpenCode**：`opencode.json` 里加 `{ "plugin": ["magpie-tabbit-provider"] }`，
+**OpenCode**：`opencode.json` 里加 `{ "plugin": ["@magpie-community/opencode-tabbit-auth"] }`，
 再 `opencode auth login`。
 
 **Provider id:** `tabbit`

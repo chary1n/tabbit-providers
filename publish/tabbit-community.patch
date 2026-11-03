@@ -27,10 +27,10 @@ index 0000000..dffe184
 +SOFTWARE.
 diff --git a/packages/tabbit/README.md b/packages/tabbit/README.md
 new file mode 100644
-index 0000000..f1163c4
+index 0000000..5db453a
 --- /dev/null
 +++ b/packages/tabbit/README.md
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,192 @@
 +# Tabbit for magpie
 +
 +[Tabbit](https://web.tabbit.com) as a provider in [magpie](https://usemagpie.ai)
@@ -43,9 +43,10 @@ index 0000000..f1163c4
 +## Install
 +
 +```sh
-+magpie plugin add npm:magpie-tabbit-provider     # from this folder: magpie plugin add ./tabbit_providers
-+magpie plugin login tabbit                       # pick “Read Tabbit Browser sign-in (macOS)”
-+magpie provider test tabbit                      # ✓ chat · Default
++magpie plugin add @magpie-community/opencode-tabbit-auth   # from the community list
++# from this source tree instead:   magpie plugin add .
++magpie plugin login tabbit                                 # pick “Read Tabbit Browser sign-in (macOS)”
++magpie provider test tabbit                                # ✓ chat · Default
 +```
 +
 +Then pick `tabbit/<model>` in any agent's model row on magpie's Agents page —
@@ -59,7 +60,7 @@ index 0000000..f1163c4
 +标签条最右的 **插件** → 「Tabbit · 每日自动签到」打开开关（还有「立即签到」按钮）。
 +Tabbit 的签到就是桌面宠物那个活动，结果会画在用量卡片上。
 +
-+**OpenCode**：`opencode.json` 里加 `{ "plugin": ["magpie-tabbit-provider"] }`，
++**OpenCode**：`opencode.json` 里加 `{ "plugin": ["@magpie-community/opencode-tabbit-auth"] }`，
 +再 `opencode auth login`。
 +
 +**Provider id:** `tabbit`
@@ -225,10 +226,10 @@ index 0000000..f1163c4
 \ No newline at end of file
 diff --git a/packages/tabbit/index.mjs b/packages/tabbit/index.mjs
 new file mode 100644
-index 0000000..8933493
+index 0000000..3aee862
 --- /dev/null
 +++ b/packages/tabbit/index.mjs
-@@ -0,0 +1,495 @@
+@@ -0,0 +1,533 @@
 +// Tabbit (web.tabbit.com) as a magpie provider.
 +//
 +// The shape is the one every magpie provider plugin has — config, auth,
@@ -253,7 +254,6 @@ index 0000000..8933493
 +import {
 +  credsOf,
 +  expiresAt,
-+  stale,
 +  listModels,
 +  usage as readUsage,
 +  createRoom,
@@ -272,11 +272,20 @@ index 0000000..8933493
 +const SESSION = "x-magpie-tabbit-session"
 +const FREE_ONLY = "freeOnly"
 +const ROOM_TTL = 30 * 60 * 1000
++// A cap as well as the TTL: a process that runs for days sees many sessions,
++// and the map must not grow with them. Oldest goes first.
++const ROOM_LIMIT = 256
 +
 +// Rooms are this process's memory of a magpie session, one per session id.
 +// They are not persisted: a restart starts new rooms, which costs nothing
 +// because a room whose transcript no longer matters is simply abandoned.
 +const rooms = new Map()
++
++// pruneRooms drops what is past its TTL and then the oldest beyond the cap.
++function pruneRooms(now = Date.now()) {
++  for (const [k, entry] of rooms) if (now - entry.at >= ROOM_TTL) rooms.delete(k)
++  while (rooms.size > ROOM_LIMIT) rooms.delete(rooms.keys().next().value)
++}
 +
 +const clean = (v) => (typeof v === "string" ? v.trim() : "")
 +
@@ -421,14 +430,19 @@ index 0000000..8933493
 +  }
 +}
 +
-+// errorResponse carries the sign-in state magpie reads: `X-Magpie-Sign-In:
-+// expired` marks the account, and a 403 with code 492 leaves it alone (the
-+// model isn't on the plan; the sign-in is fine).
++// Statuses magpie reads for itself: a 400/404 is the request's fault, a 429
++// says wait, 401 marks the account, and 403 with code 492 is a paywall the
++// account survives. Anything else is a gateway failure and goes as 502.
++const PASS_THROUGH = new Set([400, 401, 403, 404, 429])
++
++// errorResponse carries the sign-in state magpie reads (`X-Magpie-Sign-In:
++// expired` on a 401) and Tabbit's `retry-after` on a 429.
 +function errorResponse(error) {
 +  const status = Number.isFinite(error?.status) ? error.status : 500
 +  const headers = { "content-type": "application/json" }
 +  if (error?.signIn) headers["x-magpie-sign-in"] = error.signIn
-+  const passthrough = status === 401 || status === 403
++  if (error?.retryAfter) headers["retry-after"] = String(error.retryAfter)
++  const passthrough = PASS_THROUGH.has(status)
 +  return new Response(
 +    JSON.stringify({
 +      error: {
@@ -446,19 +460,33 @@ index 0000000..8933493
 +// producing for a while otherwise, and the account pays for it.
 +function streamTurn(response, { model, plan, body, signal, onEnd, onCancel }) {
 +  const encoder = new TextEncoder()
++  const stopReading = new AbortController()
 +  return new ReadableStream({
 +    async start(controller) {
-+      const send = (text) => controller.enqueue(encoder.encode(text))
++      const send = (text) => {
++        try {
++          controller.enqueue(encoder.encode(text))
++        } catch {
++          /* the reader went away */
++        }
++      }
 +      let text = ""
 +      try {
 +        send(chunkLine(model, { role: "assistant", content: "" }))
-+        for await (const part of turnDeltas(response, { signal })) {
++        for await (const part of turnDeltas(response, { signal: signal ? AbortSignal.any([signal, stopReading.signal]) : stopReading.signal })) {
 +          if (part.type === "thinking" && part.value) send(chunkLine(model, { reasoning_content: part.value }))
 +          else if (part.type === "text" && part.value) {
 +            text += part.value
 +            send(chunkLine(model, { content: part.value }))
 +          } else if (part.type === "end") {
 +            if (part.state.failed) throw new TabbitError(`Tabbit's turn failed: ${JSON.stringify(part.state.failed).slice(0, 300)}`)
++            if (part.state.truncated) {
++              // The turn never finished. An empty or half answer reported as
++              // `stop` would be taken as the answer; this says it is not.
++              send(`data: ${JSON.stringify({ error: { message: "Tabbit's turn ended without finishing", type: "tabbit_error" } })}\n\n`)
++              send("data: [DONE]\n\n")
++              return
++            }
 +            const usage = body?.stream_options?.include_usage
 +              ? {
 +                  prompt_tokens: estimateTokens(plan.content),
@@ -485,6 +513,10 @@ index 0000000..8933493
 +      }
 +    },
 +    async cancel() {
++      // Stop reading the stream, then tell Tabbit to end the run: leaving it
++      // producing would spend the account's allowance for an answer nobody
++      // will read.
++      stopReading.abort(new Error("cancelled"))
 +      try {
 +        await onCancel?.()
 +      } catch {
@@ -509,7 +541,12 @@ index 0000000..8933493
 +    if (!creds) throw Object.assign(new TabbitError("tabbit: not signed in", { status: 401 }), { signIn: "expired" })
 +
 +    const session = sessionOf(request.headers)
-+    const plan = planTurn(rooms.get(session), messages)
++    // The account is part of the key: magpie may send a session's next request
++    // on another account, and continuing that account's room would either be
++    // refused (403 → marked signed out) or answered by someone else's room.
++    const account = creds.uid || "?"
++    const roomKey = session ? `${account}\u0000${session}` : ""
++    const plan = planTurn(rooms.get(roomKey), messages)
 +
 +    const start = async (roomId, parentMessageId) => {
 +      await runTurn(creds, roomId, { content: plan.content, model, parentMessageId, signal: request.signal })
@@ -540,8 +577,8 @@ index 0000000..8933493
 +        plan,
 +        body,
 +        signal: request.signal,
-+        onEnd: (state) => remember(session, room, plan.history, state?.assistantMessageId ?? null),
-+        onCancel: () => stop(creds, room, request.signal),
++        onEnd: (state) => remember(roomKey, room, plan.history, state?.assistantMessageId ?? null),
++        onCancel: () => stop(creds, room),
 +      })
 +      return new Response(stream, {
 +        status: 200,
@@ -562,7 +599,7 @@ index 0000000..8933493
 +        if (part.state.truncated) throw new TabbitError("Tabbit's turn was cut before it finished")
 +      }
 +    }
-+    remember(session, room, plan.history, assistantId)
++    remember(roomKey, room, plan.history, assistantId)
 +    return Response.json(
 +      completionBody(model, text, reasoning, {
 +        prompt_tokens: estimateTokens(plan.content),
@@ -572,10 +609,12 @@ index 0000000..8933493
 +    )
 +  }
 +
-+  function remember(session, room, history, parent) {
-+    if (!session) return
-+    rooms.set(session, { room, parent, sent: history, at: Date.now() })
++  function remember(key, room, history, parent) {
++    if (!key) return
++    pruneRooms()
++    rooms.set(key, { room, parent, sent: history, at: Date.now() })
 +  }
++
 +
 +  return {
 +    async config(cfg) {
@@ -622,11 +661,11 @@ index 0000000..8933493
 +          apiKey: "",
 +          async fetch(input, init) {
 +            const request = new Request(input, init)
-+            const path = new URL(request.url).pathname
-+            if (request.method !== "POST" || !path.endsWith("/chat/completions")) {
-+              throw new TabbitError(`tabbit: ${request.method} ${path} is not served by this provider`, { status: 404 })
-+            }
 +            try {
++              const path = new URL(request.url).pathname
++              if (request.method !== "POST" || !path.endsWith("/chat/completions")) {
++                throw new TabbitError(`tabbit: ${request.method} ${path} is not served by this provider`, { status: 404 })
++              }
 +              return await chat(getAuth, request)
 +            } catch (error) {
 +              return errorResponse(error)
@@ -698,7 +737,6 @@ index 0000000..8933493
 +            windows: [usageWindow(data)],
 +            ...(auth?.metadata?.userId || creds.uid ? { accountId: auth?.metadata?.userId || creds.uid } : {}),
 +            ...(expiresAt(auth) ? { expiresAt: expiresAt(auth) } : {}),
-+            ...(stale(auth) ? { error: "This sign-in has expired; read it again", signIn: "expired" } : {}),
 +          }
 +        } catch (error) {
 +          return { error: error?.message ?? String(error), signIn: error?.signIn, windows: [] }
@@ -722,6 +760,7 @@ index 0000000..8933493
 +  usageWindow,
 +  parseCycleDate,
 +  estimateTokens,
++  pruneRooms,
 +  rooms,
 +}
 diff --git a/packages/tabbit/opencode.mjs b/packages/tabbit/opencode.mjs
@@ -1336,13 +1375,13 @@ index 0000000..7aa300b
 +export default { id: pkg.name, setup: (ctx) => setup(ctx) }
 diff --git a/packages/tabbit/package.json b/packages/tabbit/package.json
 new file mode 100644
-index 0000000..ddc93c8
+index 0000000..e84ae9d
 --- /dev/null
 +++ b/packages/tabbit/package.json
 @@ -0,0 +1,51 @@
 +{
 +  "name": "@magpie-community/opencode-tabbit-auth",
-+  "version": "0.1.0",
++  "version": "0.1.1",
 +  "description": "Tabbit (web.tabbit.com) as a magpie / OpenCode provider: live model catalog, cookie sign-in, chat completions, cycle usage and the daily check-in",
 +  "type": "module",
 +  "main": "./opencode.mjs",
@@ -1371,7 +1410,7 @@ index 0000000..ddc93c8
 +    "node": ">=22"
 +  },
 +  "scripts": {
-+    "test": "node --test tests/"
++    "test": "node --test tests/*.test.mjs"
 +  },
 +  "magpie": {
 +    "icon": "https://web.tabbit.com/favicon.ico",
@@ -1393,10 +1432,10 @@ index 0000000..ddc93c8
 +}
 diff --git a/packages/tabbit/src/api.mjs b/packages/tabbit/src/api.mjs
 new file mode 100644
-index 0000000..2d4aeb1
+index 0000000..e33f540
 --- /dev/null
 +++ b/packages/tabbit/src/api.mjs
-@@ -0,0 +1,295 @@
+@@ -0,0 +1,306 @@
 +// Tabbit's own HTTP API, as the web app (web.tabbit.com) calls it.
 +//
 +// Everything here was measured against a live signed-in session:
@@ -1549,6 +1588,8 @@ index 0000000..2d4aeb1
 +      { status: res.status, code: Number.isFinite(code) ? code : undefined, action },
 +    )
 +    if (!paywalled) error.signIn = "expired"
++    const retryAfter = res.headers.get("retry-after")
++    if (retryAfter) error.retryAfter = retryAfter
 +    throw error
 +  }
 +  if (!res.ok) {
@@ -1558,7 +1599,10 @@ index 0000000..2d4aeb1
 +    } catch {
 +      /* nothing to add */
 +    }
-+    throw new TabbitError(`Tabbit answered HTTP ${res.status}${body ? `: ${body.slice(0, 300)}` : ""}`, { status: res.status })
++    const error = new TabbitError(`Tabbit answered HTTP ${res.status}${body ? `: ${body.slice(0, 300)}` : ""}`, { status: res.status })
++    const retryAfter = res.headers.get("retry-after")
++    if (retryAfter) error.retryAfter = retryAfter
++    throw error
 +  }
 +  return res
 +}
@@ -1603,6 +1647,9 @@ index 0000000..2d4aeb1
 +  const body = {
 +    client_run_id: rid,
 +    client_message_id: rid,
++    // What the web app sends for a plain chat turn too — captured from it:
++    // `agent_plan_mode_enabled: true` with `agent_mode: false`. Setting either
++    // differently would turn on Tabbit's own planning step or server tools.
 +    agent_plan_mode_enabled: true,
 +    input_payload: {
 +      task_name: "chat",
@@ -1685,9 +1732,12 @@ index 0000000..2d4aeb1
 +}
 +
 +// stop asks Tabbit to end a run, which is what a cancelled request gets.
-+export async function stop(creds, room, signal) {
++export async function stop(creds, room) {
 +  try {
-+    await call(creds, "/proxy/v0/chat/stop/", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: room }) }, signal)
++    // Its own short timeout, never the caller's signal: the usual caller is a
++    // request that was just aborted, and combining that signal would fail the
++    // stop at once and leave the turn spending the account's allowance.
++    await call(creds, "/proxy/v0/chat/stop/", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: room }) }, AbortSignal.timeout(5000))
 +  } catch {
 +    /* stopping is best effort */
 +  }
@@ -1786,18 +1836,19 @@ index 0000000..e234d92
 \ No newline at end of file
 diff --git a/packages/tabbit/src/cookie.mjs b/packages/tabbit/src/cookie.mjs
 new file mode 100644
-index 0000000..e3b5ac3
+index 0000000..b18e845
 --- /dev/null
 +++ b/packages/tabbit/src/cookie.mjs
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,166 @@
 +// Reading the sign-in out of the Tabbit desktop app, without opening it.
 +//
 +// Tabbit Browser keeps the same Chromium cookie store every Chromium does:
 +//   macOS  ~/Library/Application Support/Tabbit Browser/Default/Cookies
-+//   Linux  ~/.config/Tabbit Browser/Default/Cookies (or the sibling dirs below)
 +// and protects the value with the platform's own key. The database is copied
 +// before it is read: a running browser holds a lock on a WAL, and reading the
-+// live file gives a half-written row.
++// live file gives a half-written row. The copy is removed again in a finally:
++// it holds every site's cookies, and a copy left behind each sign-in would
++// leave that in the temp folder.
 +//
 +// macOS: `Tabbit Browser Safe Storage` in the login keychain holds the
 +// password, and a Chromium cookie is AES-128-CBC under
@@ -1805,8 +1856,9 @@ index 0000000..e3b5ac3
 +// IV, prefixed `v10`, padded PKCS#7, and (on Chromium 24 and later) a 32-byte
 +// SHA-256 of the host in front of the plaintext.
 +//
-+// Windows does the same with DPAPI instead of a keychain; that is not
-+// implemented here, and the plugin says so rather than failing obscurely.
++// Only macOS is served here. Windows needs DPAPI and Linux a different store
++// key, neither implemented; both use the paste method instead, and this says
++// so rather than failing obscurely.
 +
 +import fs from "node:fs"
 +import os from "node:os"
@@ -1879,10 +1931,8 @@ index 0000000..e3b5ac3
 +  const buf = Buffer.isBuffer(blob) ? blob : Buffer.from(blob)
 +  const prefix = buf.subarray(0, 3).toString("latin1")
 +  if (prefix !== "v10" && prefix !== "v11") throw new Error(`unsupported cookie encryption (${prefix})`)
-+  const key =
-+    process.platform === "linux" && !password
-+      ? crypto.pbkdf2Sync("peanuts", "saltysalt", 1, 16, "sha1")
-+      : crypto.pbkdf2Sync(password, "saltysalt", 1003, 16, "sha1")
++  if (typeof password !== "string" || !password) throw new Error("a password is needed to decrypt a Chromium cookie")
++  const key = crypto.pbkdf2Sync(password, "saltysalt", 1003, 16, "sha1")
 +  const decipher = crypto.createDecipheriv("aes-128-cbc", key, Buffer.alloc(16, 0x20))
 +  decipher.setAutoPadding(false)
 +  let plain = Buffer.concat([decipher.update(buf.subarray(3)), decipher.final()])
@@ -1921,20 +1971,30 @@ index 0000000..e3b5ac3
 +
 +// desktopSignIn returns the cookie header and what it belongs to, or throws
 +// with the reason a caller can show.
-+export function desktopSignIn({ dirs = profileDirs(), host = HOST, store, password } = {}) {
-+  if (process.platform === "win32") throw new Error("reading Tabbit's cookies on Windows needs DPAPI, which this plugin doesn't do yet; paste the token instead")
++//
++// `platform` and `tmpParent` are for the tests: the same code path runs with a
++// fixture store under a temp parent the test can look into afterwards.
++export function desktopSignIn({ dirs = profileDirs(), host = HOST, store, password, tmpParent, platform = process.platform } = {}) {
++  if (platform !== "darwin") {
++    throw new Error(`reading Tabbit Browser's cookies is macOS-only; on ${platform} paste the token instead`)
++  }
 +  const file = store || cookieStore(dirs)
 +  if (!file) throw new Error(`no Tabbit Browser cookie store found; looked in ${dirs.join(", ")}`)
-+  const copy = copyStore(file)
-+  const rows = readCookies(copy, { host })
-+  const token = rows.find((r) => r.name === "token")
-+  if (!token) throw new Error(`Tabbit Browser is not signed in to ${host}`)
-+  const secret = password ?? keychainPassword()
-+  const value = token.value?.startsWith("ey") ? token.value : decryptValue(token.encrypted, { password: secret, host })
-+  const uid = rows.find((r) => r.name === "user_id")
-+  const uidValue = uid?.value || (uid?.encrypted ? safeDecrypt(uid.encrypted, secret, host) : "")
-+  const header = [`token=${value}`, uidValue && `user_id=${uidValue}`, uidValue && `SAPISID=${uidValue}`, "managed=tab_browser"].filter(Boolean).join("; ")
-+  return { key: header, userId: uidValue, store: file }
++  const dir = fs.mkdtempSync(path.join(tmpParent ?? os.tmpdir(), "tabbit-cookies-"))
++  try {
++    const copy = copyStore(file, dir)
++    const rows = readCookies(copy, { host })
++    const token = rows.find((r) => r.name === "token")
++    if (!token) throw new Error(`Tabbit Browser is not signed in to ${host}`)
++    const secret = password ?? keychainPassword()
++    const value = token.value?.startsWith("ey") ? token.value : decryptValue(token.encrypted, { password: secret, host })
++    const uid = rows.find((r) => r.name === "user_id")
++    const uidValue = uid?.value || (uid?.encrypted ? safeDecrypt(uid.encrypted, secret, host) : "")
++    const header = [`token=${value}`, uidValue && `user_id=${uidValue}`, uidValue && `SAPISID=${uidValue}`, "managed=tab_browser"].filter(Boolean).join("; ")
++    return { key: header, userId: uidValue, store: file }
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true })
++  }
 +}
 +
 +function safeDecrypt(blob, password, host) {
@@ -2072,10 +2132,10 @@ index 0000000..24a8115
 \ No newline at end of file
 diff --git a/packages/tabbit/src/sse.mjs b/packages/tabbit/src/sse.mjs
 new file mode 100644
-index 0000000..194dea5
+index 0000000..37e8b39
 --- /dev/null
 +++ b/packages/tabbit/src/sse.mjs
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,195 @@
 +// Tabbit's turn stream, read as the events the web app reads.
 +//
 +// The wire is `text/event-stream` with `event:`/`data:`/`id:` lines and a
@@ -2254,7 +2314,10 @@ index 0000000..194dea5
 +    clearTimeout(timer)
 +    signal?.removeEventListener?.("abort", onAbort)
 +  }
-+  if (!state.completed && !state.failed) state.truncated = state.text.length > 0
++  // No run_completed and no run_failed: the turn did not finish, even when it
++  // produced no text at all. An empty reply that looks finished is an answer
++  // an agent will take as the answer.
++  if (!state.completed && !state.failed) state.truncated = true
 +  yield { type: "end", state }
 +}
 +
@@ -2403,10 +2466,10 @@ index 0000000..967ec94
 +})
 diff --git a/packages/tabbit/tests/cookie.test.mjs b/packages/tabbit/tests/cookie.test.mjs
 new file mode 100644
-index 0000000..0556947
+index 0000000..390d4ed
 --- /dev/null
 +++ b/packages/tabbit/tests/cookie.test.mjs
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,130 @@
 +// The cookie store: a synthetic Chromium v10 blob, decrypted with a known
 +// password, and the store lookup that finds the file.
 +
@@ -2416,7 +2479,7 @@ index 0000000..0556947
 +import fs from "node:fs"
 +import os from "node:os"
 +import path from "node:path"
-+import { decryptValue, cookieStore, copyStore, profileDirs, readCookies } from "../src/cookie.mjs"
++import { decryptValue, cookieStore, copyStore, profileDirs, readCookies, desktopSignIn } from "../src/cookie.mjs"
 +
 +const HOST = "web.tabbit.com"
 +const PASSWORD = "test-password"
@@ -2495,6 +2558,48 @@ index 0000000..0556947
 +  assert.equal(decryptValue(token.encrypted, { password: PASSWORD }), "tok-123")
 +  assert.equal(rows.find((r) => r.name === "user_id").value, "u-1")
 +})
++
++// ---- review round: the temp copy must not survive a sign-in ---------------
++
++function storeWith(token) {
++  let DatabaseSync
++  try {
++    DatabaseSync = globalThis.process.getBuiltinModule("node:sqlite").DatabaseSync
++  } catch {
++    return null
++  }
++  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tabbit-store-"))
++  const file = path.join(root, "Cookies")
++  const db = new DatabaseSync(file)
++  db.exec("create table cookies(host_key text, name text, value text, encrypted_value blob)")
++  if (token) db.prepare("insert into cookies values (?,?,?,?)").run(HOST, "token", "", seal(token))
++  db.prepare("insert into cookies values (?,?,?,?)").run(HOST, "user_id", "u-9", Buffer.alloc(0))
++  db.close()
++  return file
++}
++
++test("a successful desktop sign-in leaves no copy of the cookie store", () => {
++  const file = storeWith("tok-desktop")
++  if (!file) return
++  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "tabbit-parent-"))
++  const sign = desktopSignIn({ store: file, password: PASSWORD, tmpParent: parent, platform: "darwin" })
++  assert.match(sign.key, /token=tok-desktop/)
++  assert.equal(sign.userId, "u-9")
++  assert.deepEqual(fs.readdirSync(parent), [])
++})
++
++test("a failed desktop sign-in leaves no copy either", () => {
++  const file = storeWith(null)
++  if (!file) return
++  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "tabbit-parent-"))
++  assert.throws(() => desktopSignIn({ store: file, password: PASSWORD, tmpParent: parent, platform: "darwin" }), /not signed in/)
++  assert.deepEqual(fs.readdirSync(parent), [])
++})
++
++test("the desktop method is macOS-only, and says so elsewhere", () => {
++  assert.throws(() => desktopSignIn({ store: "/nonexistent/Cookies", platform: "linux" }), /macOS-only/)
++  assert.throws(() => desktopSignIn({ store: "/nonexistent/Cookies", platform: "win32" }), /macOS-only/)
++})
 diff --git a/packages/tabbit/tests/models.test.mjs b/packages/tabbit/tests/models.test.mjs
 new file mode 100644
 index 0000000..3784ab4
@@ -2567,10 +2672,10 @@ index 0000000..3784ab4
 +})
 diff --git a/packages/tabbit/tests/plugin.test.mjs b/packages/tabbit/tests/plugin.test.mjs
 new file mode 100644
-index 0000000..b863fd7
+index 0000000..a5098ca
 --- /dev/null
 +++ b/packages/tabbit/tests/plugin.test.mjs
-@@ -0,0 +1,314 @@
+@@ -0,0 +1,453 @@
 +// The plugin's own hooks: the config shape magpie reads, the room plan, and
 +// a whole request answered from a stubbed Tabbit.
 +
@@ -2885,12 +2990,151 @@ index 0000000..b863fd7
 +    _internal.rooms.clear()
 +  }
 +})
++
++// ---- review round: statuses, accounts, cancel, pruning --------------------
++
++const b64url = (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url")
++const jwtFor = (sub) => `h.${b64url({ sub, exp: 2000000000 })}.s`
++
++const chatBody = (model = "Default", messages = [{ role: "user", content: "hi" }], extra = {}) =>
++  JSON.stringify({ model, messages, stream: false, ...extra })
++
++async function fetchWith(auth, body, headers = {}) {
++  const hooks = await TabbitPlugin()
++  const loader = await hooks.auth.loader(async () => auth)
++  return loader.fetch(`${loader.baseURL}/chat/completions`, {
++    method: "POST",
++    headers: { "content-type": "application/json", ...headers },
++    body,
++  })
++}
++
++test("the plugin's own 400 (no model) passes through as 400", async () => {
++  const res = await fetchWith(auth, JSON.stringify({ messages: [{ role: "user", content: "hi" }] }))
++  assert.equal(res.status, 400)
++})
++
++test("a path this provider doesn't serve is a 404, not a 502", async () => {
++  const hooks = await TabbitPlugin()
++  const loader = await hooks.auth.loader(async () => auth)
++  const res = await loader.fetch(`${loader.baseURL}/models`, { method: "GET" })
++  assert.equal(res.status, 404)
++})
++
++test("Tabbit's 429 passes through with its retry-after", async () => {
++  const original = globalThis.fetch
++  globalThis.fetch = async (input, init = {}) => {
++    const path = new URL(typeof input === "string" ? input : input.url).pathname
++    if (path === "/api/v3/chat/rooms") return new Response("{}", { status: 429, headers: { "retry-after": "7" } })
++    return new Response("{}", { status: 200 })
++  }
++  try {
++    const res = await fetchWith(auth, chatBody())
++    assert.equal(res.status, 429)
++    assert.equal(res.headers.get("retry-after"), "7")
++  } finally {
++    globalThis.fetch = original
++  }
++})
++
++test("a 500 from Tabbit is a 502 here", async () => {
++  const original = globalThis.fetch
++  globalThis.fetch = async (input) => {
++    const path = new URL(typeof input === "string" ? input : input.url).pathname
++    if (path === "/api/v3/chat/rooms") return new Response("boom", { status: 500 })
++    return new Response("{}", { status: 200 })
++  }
++  try {
++    const res = await fetchWith(auth, chatBody())
++    assert.equal(res.status, 502)
++  } finally {
++    globalThis.fetch = original
++  }
++})
++
++test("rooms are keyed by account as well as session", async () => {
++  const { calls, restore } = installFetch()
++  try {
++    _internal.rooms.clear()
++    let current = { type: "api", key: jwtFor("acct-a") }
++    const hooks = await TabbitPlugin()
++    const loader = await hooks.auth.loader(async () => current)
++    const send = () =>
++      loader.fetch(`${loader.baseURL}/chat/completions`, {
++        method: "POST",
++        headers: { "content-type": "application/json", "x-magpie-tabbit-session": "shared" },
++        body: chatBody(),
++      })
++    await send()
++    current = { type: "api", key: jwtFor("acct-b") }
++    await send()
++    // the second account must not continue the first account's room
++    assert.equal(calls.filter((c) => c.path === "/api/v3/chat/rooms" && c.method === "POST").length, 2)
++  } finally {
++    restore()
++    _internal.rooms.clear()
++  }
++})
++
++test("cancelling the stream asks Tabbit to stop the run", async () => {
++  const encoder = new TextEncoder()
++  const calls = []
++  const original = globalThis.fetch
++  globalThis.fetch = async (input, init = {}) => {
++    const path = new URL(typeof input === "string" ? input : input.url).pathname
++    const method = (init.method ?? "GET").toUpperCase()
++    calls.push({ method, path })
++    if (path === "/api/v3/chat/rooms") return Response.json({ room_id: "room-cancel" })
++    if (path.endsWith("/runs")) return Response.json({ run_id: "r1" })
++    if (path.endsWith("/join")) {
++      return new Response(
++        new ReadableStream({
++          start(c) {
++            c.enqueue(encoder.encode(frame("assistant_message_started", { payload: { run_id: "r1", message_id: "a1" } })))
++            c.enqueue(encoder.encode(frame("assistant_message_delta", { payload: { chunk_payload: { content: "半" } } })))
++            // keep it open: the reader goes away mid-stream
++          },
++          cancel() {},
++        }),
++        { status: 200, headers: { "content-type": "text/event-stream" } },
++      )
++    }
++    return new Response("{}", { status: 200 })
++  }
++  try {
++    const hooks = await TabbitPlugin()
++    const loader = await hooks.auth.loader(async () => auth)
++    const res = await loader.fetch(`${loader.baseURL}/chat/completions`, {
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({ model: "Default", messages: [{ role: "user", content: "hi" }], stream: true }),
++    })
++    const reader = res.body.getReader()
++    await reader.read()
++    await reader.cancel()
++    await new Promise((r) => setTimeout(r, 150))
++    assert.ok(calls.some((c) => c.path === "/proxy/v0/chat/stop/"), "stop was never called: " + JSON.stringify(calls))
++  } finally {
++    globalThis.fetch = original
++  }
++})
++
++test("rooms are pruned by ttl and capped in size", () => {
++  _internal.rooms.clear()
++  const stale = Date.now() - 31 * 60 * 1000
++  _internal.rooms.set("old", { room: "r", parent: null, sent: [], at: stale })
++  for (let i = 0; i < 400; i++) _internal.rooms.set(`k${i}`, { room: "r", parent: null, sent: [], at: Date.now() })
++  _internal.pruneRooms()
++  assert.equal(_internal.rooms.has("old"), false)
++  assert.ok(_internal.rooms.size <= 256, "size " + _internal.rooms.size)
++  _internal.rooms.clear()
++})
 diff --git a/packages/tabbit/tests/sse.test.mjs b/packages/tabbit/tests/sse.test.mjs
 new file mode 100644
-index 0000000..b177f0c
+index 0000000..7be38c4
 --- /dev/null
 +++ b/packages/tabbit/tests/sse.test.mjs
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,118 @@
 +// Reading a turn: the recorded frames of a real one, replayed.
 +
 +import test from "node:test"
@@ -2997,6 +3241,17 @@ index 0000000..b177f0c
 +  const deltas = frame("assistant_message_delta", { payload: { chunk_payload: { content: "新回答" } } })
 +  const state = await readTurn(responseOf([history, runs, deltas, frame("run_completed", { payload: {} })]))
 +  assert.equal(state.text, "新回答")
++})
++
++test("a stream that closes before any answer is unfinished, not empty-but-done", async () => {
++  // join closes after assistant_message_started, before any text or run_completed
++  const state = await readTurn(responseOf([
++    frame("snapshot_begin", { payload: {} }),
++    frame("assistant_message_started", { payload: { run_id: "r1", message_id: "a1" } }),
++  ]))
++  assert.equal(state.text, "")
++  assert.equal(state.completed, false)
++  assert.equal(state.truncated, true)
 +})
 diff --git a/registry.json b/registry.json
 index fa8ca20..b6f5e0b 100644

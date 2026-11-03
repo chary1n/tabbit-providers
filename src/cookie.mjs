@@ -2,10 +2,11 @@
 //
 // Tabbit Browser keeps the same Chromium cookie store every Chromium does:
 //   macOS  ~/Library/Application Support/Tabbit Browser/Default/Cookies
-//   Linux  ~/.config/Tabbit Browser/Default/Cookies (or the sibling dirs below)
 // and protects the value with the platform's own key. The database is copied
 // before it is read: a running browser holds a lock on a WAL, and reading the
-// live file gives a half-written row.
+// live file gives a half-written row. The copy is removed again in a finally:
+// it holds every site's cookies, and a copy left behind each sign-in would
+// leave that in the temp folder.
 //
 // macOS: `Tabbit Browser Safe Storage` in the login keychain holds the
 // password, and a Chromium cookie is AES-128-CBC under
@@ -13,8 +14,9 @@
 // IV, prefixed `v10`, padded PKCS#7, and (on Chromium 24 and later) a 32-byte
 // SHA-256 of the host in front of the plaintext.
 //
-// Windows does the same with DPAPI instead of a keychain; that is not
-// implemented here, and the plugin says so rather than failing obscurely.
+// Only macOS is served here. Windows needs DPAPI and Linux a different store
+// key, neither implemented; both use the paste method instead, and this says
+// so rather than failing obscurely.
 
 import fs from "node:fs"
 import os from "node:os"
@@ -87,10 +89,8 @@ export function decryptValue(blob, { password, host = HOST } = {}) {
   const buf = Buffer.isBuffer(blob) ? blob : Buffer.from(blob)
   const prefix = buf.subarray(0, 3).toString("latin1")
   if (prefix !== "v10" && prefix !== "v11") throw new Error(`unsupported cookie encryption (${prefix})`)
-  const key =
-    process.platform === "linux" && !password
-      ? crypto.pbkdf2Sync("peanuts", "saltysalt", 1, 16, "sha1")
-      : crypto.pbkdf2Sync(password, "saltysalt", 1003, 16, "sha1")
+  if (typeof password !== "string" || !password) throw new Error("a password is needed to decrypt a Chromium cookie")
+  const key = crypto.pbkdf2Sync(password, "saltysalt", 1003, 16, "sha1")
   const decipher = crypto.createDecipheriv("aes-128-cbc", key, Buffer.alloc(16, 0x20))
   decipher.setAutoPadding(false)
   let plain = Buffer.concat([decipher.update(buf.subarray(3)), decipher.final()])
@@ -129,20 +129,30 @@ function require_node_sqlite() {
 
 // desktopSignIn returns the cookie header and what it belongs to, or throws
 // with the reason a caller can show.
-export function desktopSignIn({ dirs = profileDirs(), host = HOST, store, password } = {}) {
-  if (process.platform === "win32") throw new Error("reading Tabbit's cookies on Windows needs DPAPI, which this plugin doesn't do yet; paste the token instead")
+//
+// `platform` and `tmpParent` are for the tests: the same code path runs with a
+// fixture store under a temp parent the test can look into afterwards.
+export function desktopSignIn({ dirs = profileDirs(), host = HOST, store, password, tmpParent, platform = process.platform } = {}) {
+  if (platform !== "darwin") {
+    throw new Error(`reading Tabbit Browser's cookies is macOS-only; on ${platform} paste the token instead`)
+  }
   const file = store || cookieStore(dirs)
   if (!file) throw new Error(`no Tabbit Browser cookie store found; looked in ${dirs.join(", ")}`)
-  const copy = copyStore(file)
-  const rows = readCookies(copy, { host })
-  const token = rows.find((r) => r.name === "token")
-  if (!token) throw new Error(`Tabbit Browser is not signed in to ${host}`)
-  const secret = password ?? keychainPassword()
-  const value = token.value?.startsWith("ey") ? token.value : decryptValue(token.encrypted, { password: secret, host })
-  const uid = rows.find((r) => r.name === "user_id")
-  const uidValue = uid?.value || (uid?.encrypted ? safeDecrypt(uid.encrypted, secret, host) : "")
-  const header = [`token=${value}`, uidValue && `user_id=${uidValue}`, uidValue && `SAPISID=${uidValue}`, "managed=tab_browser"].filter(Boolean).join("; ")
-  return { key: header, userId: uidValue, store: file }
+  const dir = fs.mkdtempSync(path.join(tmpParent ?? os.tmpdir(), "tabbit-cookies-"))
+  try {
+    const copy = copyStore(file, dir)
+    const rows = readCookies(copy, { host })
+    const token = rows.find((r) => r.name === "token")
+    if (!token) throw new Error(`Tabbit Browser is not signed in to ${host}`)
+    const secret = password ?? keychainPassword()
+    const value = token.value?.startsWith("ey") ? token.value : decryptValue(token.encrypted, { password: secret, host })
+    const uid = rows.find((r) => r.name === "user_id")
+    const uidValue = uid?.value || (uid?.encrypted ? safeDecrypt(uid.encrypted, secret, host) : "")
+    const header = [`token=${value}`, uidValue && `user_id=${uidValue}`, uidValue && `SAPISID=${uidValue}`, "managed=tab_browser"].filter(Boolean).join("; ")
+    return { key: header, userId: uidValue, store: file }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 }
 
 function safeDecrypt(blob, password, host) {

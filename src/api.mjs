@@ -150,6 +150,8 @@ async function call(creds, path, init = {}, signal) {
       { status: res.status, code: Number.isFinite(code) ? code : undefined, action },
     )
     if (!paywalled) error.signIn = "expired"
+    const retryAfter = res.headers.get("retry-after")
+    if (retryAfter) error.retryAfter = retryAfter
     throw error
   }
   if (!res.ok) {
@@ -159,7 +161,10 @@ async function call(creds, path, init = {}, signal) {
     } catch {
       /* nothing to add */
     }
-    throw new TabbitError(`Tabbit answered HTTP ${res.status}${body ? `: ${body.slice(0, 300)}` : ""}`, { status: res.status })
+    const error = new TabbitError(`Tabbit answered HTTP ${res.status}${body ? `: ${body.slice(0, 300)}` : ""}`, { status: res.status })
+    const retryAfter = res.headers.get("retry-after")
+    if (retryAfter) error.retryAfter = retryAfter
+    throw error
   }
   return res
 }
@@ -204,6 +209,9 @@ export async function runTurn(creds, room, { content, model, parentMessageId = n
   const body = {
     client_run_id: rid,
     client_message_id: rid,
+    // What the web app sends for a plain chat turn too — captured from it:
+    // `agent_plan_mode_enabled: true` with `agent_mode: false`. Setting either
+    // differently would turn on Tabbit's own planning step or server tools.
     agent_plan_mode_enabled: true,
     input_payload: {
       task_name: "chat",
@@ -286,9 +294,12 @@ export async function signIn(creds, { scenes = SIGN_IN_SCENES, requestNo = crypt
 }
 
 // stop asks Tabbit to end a run, which is what a cancelled request gets.
-export async function stop(creds, room, signal) {
+export async function stop(creds, room) {
   try {
-    await call(creds, "/proxy/v0/chat/stop/", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: room }) }, signal)
+    // Its own short timeout, never the caller's signal: the usual caller is a
+    // request that was just aborted, and combining that signal would fail the
+    // stop at once and leave the turn spending the account's allowance.
+    await call(creds, "/proxy/v0/chat/stop/", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: room }) }, AbortSignal.timeout(5000))
   } catch {
     /* stopping is best effort */
   }

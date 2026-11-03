@@ -105,3 +105,14 @@ test("a new turn's snapshot is not replayed as this turn's text", async () => {
   const state = await readTurn(responseOf([history, runs, deltas, frame("run_completed", { payload: {} })]))
   assert.equal(state.text, "新回答")
 })
+
+test("a stream that closes before any answer is unfinished, not empty-but-done", async () => {
+  // join closes after assistant_message_started, before any text or run_completed
+  const state = await readTurn(responseOf([
+    frame("snapshot_begin", { payload: {} }),
+    frame("assistant_message_started", { payload: { run_id: "r1", message_id: "a1" } }),
+  ]))
+  assert.equal(state.text, "")
+  assert.equal(state.completed, false)
+  assert.equal(state.truncated, true)
+})

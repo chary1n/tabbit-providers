@@ -312,3 +312,142 @@ test("a different session gets its own room and a flattened prompt", async () =>
     _internal.rooms.clear()
   }
 })
+
+// ---- review round: statuses, accounts, cancel, pruning --------------------
+
+const b64url = (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url")
+const jwtFor = (sub) => `h.${b64url({ sub, exp: 2000000000 })}.s`
+
+const chatBody = (model = "Default", messages = [{ role: "user", content: "hi" }], extra = {}) =>
+  JSON.stringify({ model, messages, stream: false, ...extra })
+
+async function fetchWith(auth, body, headers = {}) {
+  const hooks = await TabbitPlugin()
+  const loader = await hooks.auth.loader(async () => auth)
+  return loader.fetch(`${loader.baseURL}/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body,
+  })
+}
+
+test("the plugin's own 400 (no model) passes through as 400", async () => {
+  const res = await fetchWith(auth, JSON.stringify({ messages: [{ role: "user", content: "hi" }] }))
+  assert.equal(res.status, 400)
+})
+
+test("a path this provider doesn't serve is a 404, not a 502", async () => {
+  const hooks = await TabbitPlugin()
+  const loader = await hooks.auth.loader(async () => auth)
+  const res = await loader.fetch(`${loader.baseURL}/models`, { method: "GET" })
+  assert.equal(res.status, 404)
+})
+
+test("Tabbit's 429 passes through with its retry-after", async () => {
+  const original = globalThis.fetch
+  globalThis.fetch = async (input, init = {}) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname
+    if (path === "/api/v3/chat/rooms") return new Response("{}", { status: 429, headers: { "retry-after": "7" } })
+    return new Response("{}", { status: 200 })
+  }
+  try {
+    const res = await fetchWith(auth, chatBody())
+    assert.equal(res.status, 429)
+    assert.equal(res.headers.get("retry-after"), "7")
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test("a 500 from Tabbit is a 502 here", async () => {
+  const original = globalThis.fetch
+  globalThis.fetch = async (input) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname
+    if (path === "/api/v3/chat/rooms") return new Response("boom", { status: 500 })
+    return new Response("{}", { status: 200 })
+  }
+  try {
+    const res = await fetchWith(auth, chatBody())
+    assert.equal(res.status, 502)
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test("rooms are keyed by account as well as session", async () => {
+  const { calls, restore } = installFetch()
+  try {
+    _internal.rooms.clear()
+    let current = { type: "api", key: jwtFor("acct-a") }
+    const hooks = await TabbitPlugin()
+    const loader = await hooks.auth.loader(async () => current)
+    const send = () =>
+      loader.fetch(`${loader.baseURL}/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-magpie-tabbit-session": "shared" },
+        body: chatBody(),
+      })
+    await send()
+    current = { type: "api", key: jwtFor("acct-b") }
+    await send()
+    // the second account must not continue the first account's room
+    assert.equal(calls.filter((c) => c.path === "/api/v3/chat/rooms" && c.method === "POST").length, 2)
+  } finally {
+    restore()
+    _internal.rooms.clear()
+  }
+})
+
+test("cancelling the stream asks Tabbit to stop the run", async () => {
+  const encoder = new TextEncoder()
+  const calls = []
+  const original = globalThis.fetch
+  globalThis.fetch = async (input, init = {}) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname
+    const method = (init.method ?? "GET").toUpperCase()
+    calls.push({ method, path })
+    if (path === "/api/v3/chat/rooms") return Response.json({ room_id: "room-cancel" })
+    if (path.endsWith("/runs")) return Response.json({ run_id: "r1" })
+    if (path.endsWith("/join")) {
+      return new Response(
+        new ReadableStream({
+          start(c) {
+            c.enqueue(encoder.encode(frame("assistant_message_started", { payload: { run_id: "r1", message_id: "a1" } })))
+            c.enqueue(encoder.encode(frame("assistant_message_delta", { payload: { chunk_payload: { content: "半" } } })))
+            // keep it open: the reader goes away mid-stream
+          },
+          cancel() {},
+        }),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      )
+    }
+    return new Response("{}", { status: 200 })
+  }
+  try {
+    const hooks = await TabbitPlugin()
+    const loader = await hooks.auth.loader(async () => auth)
+    const res = await loader.fetch(`${loader.baseURL}/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "Default", messages: [{ role: "user", content: "hi" }], stream: true }),
+    })
+    const reader = res.body.getReader()
+    await reader.read()
+    await reader.cancel()
+    await new Promise((r) => setTimeout(r, 150))
+    assert.ok(calls.some((c) => c.path === "/proxy/v0/chat/stop/"), "stop was never called: " + JSON.stringify(calls))
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test("rooms are pruned by ttl and capped in size", () => {
+  _internal.rooms.clear()
+  const stale = Date.now() - 31 * 60 * 1000
+  _internal.rooms.set("old", { room: "r", parent: null, sent: [], at: stale })
+  for (let i = 0; i < 400; i++) _internal.rooms.set(`k${i}`, { room: "r", parent: null, sent: [], at: Date.now() })
+  _internal.pruneRooms()
+  assert.equal(_internal.rooms.has("old"), false)
+  assert.ok(_internal.rooms.size <= 256, "size " + _internal.rooms.size)
+  _internal.rooms.clear()
+})

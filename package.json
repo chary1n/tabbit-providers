@@ -1,6 +1,6 @@
 {
   "name": "magpie-tabbit-provider",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Tabbit (web.tabbit.com) as a magpie / OpenCode provider: live model catalog, cookie sign-in, chat completions, cycle usage and the daily check-in",
   "type": "module",
   "main": "./opencode.mjs",
@@ -29,7 +29,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node --test tests/"
+    "test": "node --test tests/*.test.mjs"
   },
   "magpie": {
     "icon": "https://web.tabbit.com/favicon.ico",

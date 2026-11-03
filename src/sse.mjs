@@ -176,7 +176,10 @@ export async function* turnDeltas(response, { signal, timeoutMs = STREAM_TIMEOUT
     clearTimeout(timer)
     signal?.removeEventListener?.("abort", onAbort)
   }
-  if (!state.completed && !state.failed) state.truncated = state.text.length > 0
+  // No run_completed and no run_failed: the turn did not finish, even when it
+  // produced no text at all. An empty reply that looks finished is an answer
+  // an agent will take as the answer.
+  if (!state.completed && !state.failed) state.truncated = true
   yield { type: "end", state }
 }
 
