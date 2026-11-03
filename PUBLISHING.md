@@ -31,6 +31,7 @@ publish/
 | 版本 | 时间 | 状态 |
 |---|---|---|
 | 0.1.0 | 2026-11-03 | ✅ 已上线（`latest`），`npm i magpie-tabbit-provider` 可用 |
+| 0.1.1 | 2026-11-03 | ⏳ 代码已改好（review 修复），待发布：`npm publish --otp=<6位码>` |
 
 已落地的分发入口：
 
