@@ -1,0 +1,3014 @@
+diff --git a/packages/tabbit/LICENSE b/packages/tabbit/LICENSE
+new file mode 100644
+index 0000000..dffe184
+--- /dev/null
++++ b/packages/tabbit/LICENSE
+@@ -0,0 +1,21 @@
++MIT License
++
++Copyright (c) 2026 chary1n
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+diff --git a/packages/tabbit/README.md b/packages/tabbit/README.md
+new file mode 100644
+index 0000000..f1163c4
+--- /dev/null
++++ b/packages/tabbit/README.md
+@@ -0,0 +1,191 @@
++# Tabbit for magpie
++
++[Tabbit](https://web.tabbit.com) as a provider in [magpie](https://usemagpie.ai)
++(and OpenCode). It signs in with the Tabbit Browser account already on this
++computer, lists the account's real model catalog, and answers turns through
++Tabbit's own chat API — so an agent behind magpie can pick `tabbit/Default`,
++`tabbit/DeepSeek-V4.1-Flash`, `tabbit/GLM-5.3-Flash` and the rest like any
++other provider, with the account's allowance, fallbacks and usage card.
++
++## Install
++
++```sh
++magpie plugin add npm:magpie-tabbit-provider     # from this folder: magpie plugin add ./tabbit_providers
++magpie plugin login tabbit                       # pick “Read Tabbit Browser sign-in (macOS)”
++magpie provider test tabbit                      # ✓ chat · Default
++```
++
++Then pick `tabbit/<model>` in any agent's model row on magpie's Agents page —
++or route to it from a group:
++
++```sh
++magpie group add tabbit-pool models=tabbit/Default,tabbit/DeepSeek-V4.1-Flash routing=cheap
++```
++
++**每日自动签到**：装好并登录后，magpie → 设置 →「窗口重置时预热 / 每日自动签到」→
++标签条最右的 **插件** → 「Tabbit · 每日自动签到」打开开关（还有「立即签到」按钮）。
++Tabbit 的签到就是桌面宠物那个活动，结果会画在用量卡片上。
++
++**OpenCode**：`opencode.json` 里加 `{ "plugin": ["magpie-tabbit-provider"] }`，
++再 `opencode auth login`。
++
++**Provider id:** `tabbit`
++
++This is not Tabbit's official API. It uses the endpoints Tabbit's own web app
++calls, with the sign-in that app keeps, for one person on their own machine.
++
++## Sign-in
++
++Tabbit's sign-in is a `token` cookie: an RS256 JWT issued by
++`web.tab-browser.com` with a **7-day** life. Two ways in:
++
++| Method | What it does |
++|---|---|
++| **Read Tabbit Browser sign-in** (macOS) | Finds the cookie store Tabbit Browser keeps (`~/Library/Application Support/Tabbit Browser/Default/Cookies`), reads the `token` cookie, and decrypts it with the password in the login keychain under `Tabbit Browser Safe Storage`. Nothing is copied by hand; the browser does not have to be closed — the database is copied before it is read. |
++| **Paste Tabbit token** | For anything the first method can't reach (Windows, a browser profile kept somewhere else). In Tabbit Browser, open `web.tabbit.com` and read the `token` cookie from the developer tools; paste it whole. |
++
++A pasted value may be the bare JWT or a whole `name=value; name=value` cookie
++string. The account id is read out of the token itself, so nothing else has to
++be pasted.
++
++There is no refresh endpoint. When the token runs out (7 days), magpie shows
++the account as needing a sign-in again and the first method takes one more
++click.
++
++> Windows: reading the desktop's cookie needs DPAPI, which this plugin does
++> not do yet. Use the paste method; the plugin says so instead of failing
++> vaguely.
++
++## Models
++
++The catalog comes from the account:
++`GET /proxy/v1/model_config/models?a=0&scene=chat` — the same call the Tabbit
++app makes. A model's **id is the catalog's `display_name`, verbatim**
++(`DeepSeek-V4.1-Flash`, `GLM-5.3-Flash`…), because that is the name a turn has
++to be asked with.
++
++| Catalog field | Becomes |
++|---|---|
++| `display_name` | the model id and name |
++| `supports_images` | image input on the row |
++| `support_thinking` | the reasoning flag (thinking arrives as `reasoning_content`) |
++| `model_access_type` | `free_unlimited` / `free_metered` / `premium_only` |
++| `hidden` | left out, as the app leaves it out |
++
++**Client tools are off** (`toolcall: false`). The catalog's `supports_tools`
++means Tabbit's *own* server-side tools — browser and search — not tools an
++agent declares: a turn asked to call a client-declared tool answers that it has
++no such tool. A tool-using agent should go through magpie's gateway tools
++instead.
++
++**Limits are not published** by Tabbit. Known ones are hard-coded
++(`DeepSeek-V4.1-Flash` and `DeepSeek-V4-Pro`: 1M context); everything else
++takes a default (`TABBIT_CONTEXT`, `TABBIT_OUTPUT`, 128k / 32k). A prompt past
++a real limit comes back as Tabbit's own error.
++
++**Premium models** answer `403` with code `492` on a free account. The
++**Free models only** switch in the provider's options leaves them out of the
++list instead of letting them fail at the turn.
++
++## Daily check-in (签到)
++
++Tabbit's check-in is the desktop pet's activity, and it runs on
++`/api/commerce/activity/v1/sign-in` — the same two calls the browser makes:
++
++```
++GET  /api/commerce/activity/v1/sign-in/status?scene_codes=desktop_pet
++POST /api/commerce/activity/v1/sign-in   {request_no, scene_codes:["desktop_pet"]}
++```
++
++The plugin implements magpie's `auth.checkin` hook, so it appears where
++WorkBuddy's does: **Settings → Usage → Plugins → Tabbit**, on by default after
++you flip it, and magpie then runs it once a day per account and draws the
++outcome on the account's card.
++
++It reads the status first — free, and it says whether the activity is open —
++and only claims when the day is actually unsigned. What Tabbit's answers
++become:
++
++| Tabbit says | The card shows |
++|---|---|
++| `signed_today: true` | **done** (no claim is sent at all) |
++| `sign_in_result: "signed"` | **claimed**, with the usage it granted and the day count |
++| `sign_in_result: "already_signed"` | **done** (a race, not a failure) |
++| `activity_open: false` | **inactive** |
++| no result for the scene | **ineligible** |
++| any other word | **failed**, carrying Tabbit's own word for it |
++
++`desktop_pet` is the only scene the service accepts — every other name comes
++back `SIGN_IN_SCENE_UNSUPPORTED`. The pet itself needs `required_days` (3)
++before it can be adopted, so a signed day also reports the streak
++(`1/3 days`).
++
++A `sign_in_result` this plugin hasn't seen is reported as a failure rather
++than guessed as a claim: a wrong "claimed" is worse than a failure you can
++read.
++
++## Usage
++
++`GET /api/commerce/quota/v1/usage` gives the cycle's allowance, which the
++Usage card shows as **Cycle usage** — a percentage, with when the cycle resets
++(Tabbit's cycles are weekly, named in Beijing time).
++
++## How a turn is sent
++
++`loader()` hands magpie a `fetch` that rewrites `chat/completions` into the
++three calls Tabbit's app makes:
++
++```
++POST /api/v3/chat/rooms                      → a room (the conversation)
++POST /api/v3/chat/rooms/<room>/runs          → the turn: { content, selected_model }
++POST /api/v3/chat/rooms/<room>/join          → text/event-stream
++```
++
++The stream is written back as OpenAI chunks: `assistant_message_delta` →
++`choices[].delta.content`, `event_message_chunk(thinking)` →
++`reasoning_content`, `run_completed` → `finish_reason`. A run that stops early
++is reported as `finish_reason: "length"` rather than pretending to be whole.
++
++**Conversation history** lives in the room. Each magpie session is given one
++room (`chat.headers` carries the session id), so a follow-up inside a session
++sends only the new message and hangs it off the previous answer's id — the room
++is not replayed into the prompt. A request whose transcript doesn't continue
++the room (a new session, an edited history, a room Tabbit reset) gets a fresh
++room with the whole transcript flattened into one prompt; measured, the model
++answers the last question with the earlier turns as context.
++
++`maxConcurrency` is **1**: Tabbit answers one turn at a time.
++
++## Install
++
++```sh
++magpie plugin add ./tabbit_providers       # from this directory
++magpie plugin login tabbit                 # or: pick the provider in the app
++magpie provider test tabbit
++magpie models tabbit
++```
++
++In OpenCode, add the same package under `plugin` and sign in with
++`opencode auth login`.
++
++## Development
++
++```sh
++node --test tests/        # every hook, a synthetic cookie store, recorded SSE
++node scripts/check.mjs    # loads the hooks the way magpie and OpenCode do
++```
++
++The tests never touch the network. `tests/plugin.test.mjs` stubs Tabbit's four
++endpoints; `tests/sse.test.mjs` replays a recorded turn, including a rejoin's
++snapshot and a turn cut short; `tests/cookie.test.mjs` seals and unseals a
++synthetic Chromium `v10` blob.
++
++## Limits worth knowing
++
++- A turn is a web-app turn: first text takes seconds, and one turn runs at a
++  time.
++- Tabbit keeps the room's own history, so a flattened prompt is the fallback
++  path, not the normal one. Very long transcripts past the model's limit are
++  Tabbit's call, and it answers with its own error.
++- The catalog call answers without a valid token; a token that has really
++  expired shows up at the first turn (`401 请先登录`), which marks the account.
+\ No newline at end of file
+diff --git a/packages/tabbit/index.mjs b/packages/tabbit/index.mjs
+new file mode 100644
+index 0000000..8933493
+--- /dev/null
++++ b/packages/tabbit/index.mjs
+@@ -0,0 +1,495 @@
++// Tabbit (web.tabbit.com) as a magpie provider.
++//
++// The shape is the one every magpie provider plugin has — config, auth,
++// provider.models — because the work is a plain HTTP conversation with
++// Tabbit, not a browser drive:
++//
++//   sign-in  →  the `token` cookie (JWT, 7 days) the Tabbit app keeps
++//   catalog  →  /proxy/v1/model_config/models
++//   a turn   →  create room → POST runs → POST join (SSE)
++//
++// The one thing a plain OpenAI client can't do is Tabbit's turn shape, so
++// loader() hands back a `fetch` that rewrites chat/completions into
++// room+runs+join and writes the answer back as OpenAI chunks. That is the
++// same trick the WorkBuddy plugin uses for its own protocol, not a sidecar.
++//
++// Turn history: Tabbit keeps it in the room, so a follow-up inside the same
++// magpie session sends only the new message and hangs it off the previous
++// answer's id. A request whose transcript doesn't continue the room gets a
++// new room and the whole transcript flattened into one prompt — measured:
++// the model answers the last question with the earlier turns as context.
++
++import {
++  credsOf,
++  expiresAt,
++  stale,
++  listModels,
++  usage as readUsage,
++  createRoom,
++  runTurn,
++  join,
++  stop,
++  TabbitError,
++} from "./src/api.mjs"
++import { BOOTSTRAP, NPM, CHAT_BASE, rowsOf } from "./src/models.mjs"
++import { turnDeltas } from "./src/sse.mjs"
++import { desktopSignIn } from "./src/cookie.mjs"
++import { checkinOf } from "./src/checkin.mjs"
++
++const ID = "tabbit"
++const NAME = "Tabbit"
++const SESSION = "x-magpie-tabbit-session"
++const FREE_ONLY = "freeOnly"
++const ROOM_TTL = 30 * 60 * 1000
++
++// Rooms are this process's memory of a magpie session, one per session id.
++// They are not persisted: a restart starts new rooms, which costs nothing
++// because a room whose transcript no longer matters is simply abandoned.
++const rooms = new Map()
++
++const clean = (v) => (typeof v === "string" ? v.trim() : "")
++
++function sessionOf(headers) {
++  try {
++    return clean(new Headers(headers).get(SESSION))
++  } catch {
++    return ""
++  }
++}
++
++// stripModel accepts either the bare id magpie sends the SDK or a
++// `tabbit/<id>` spelling, so a route written by hand still resolves.
++function stripModel(value) {
++  const id = clean(value)
++  return id.startsWith(`${ID}/`) ? id.slice(ID.length + 1) : id
++}
++
++// contentOf flattens one message's content: a string, or the array of parts
++// the OpenAI SDK sends. Only text parts are taken; an image part is named so
++// the turn still says something about it.
++function contentOf(content) {
++  if (typeof content === "string") return content
++  if (!Array.isArray(content)) return ""
++  const parts = []
++  for (const part of content) {
++    if (typeof part === "string") parts.push(part)
++    else if (part?.type === "text" || typeof part?.text === "string") parts.push(part.text ?? "")
++    else if (part?.type === "image_url" || part?.type === "image") parts.push("[image]")
++  }
++  return parts.join("\n")
++}
++
++// historyOf is the conversation a room would remember, in order: system
++// prompts, the user's turns and the assistant's.
++function historyOf(messages) {
++  const out = []
++  for (const message of Array.isArray(messages) ? messages : []) {
++    const role = message?.role === "assistant" ? "assistant" : message?.role === "system" ? "system" : "user"
++    const content = contentOf(message?.content)
++    if (content) out.push({ role, content })
++  }
++  return out
++}
++
++// flatten writes a transcript as one prompt. Tabbit's turn takes one
++// `content` string, and a fresh room has no history of its own, so the
++// transcript is what carries it. Measured: the model answers the last
++// question with the earlier turns as context.
++function flatten(history) {
++  const systems = history.filter((m) => m.role === "system").map((m) => m.content)
++  const turns = history.filter((m) => m.role !== "system")
++  const lastUser = [...turns].reverse().find((m) => m.role === "user")
++  const before = lastUser ? turns.slice(0, turns.lastIndexOf(lastUser)) : turns
++  const lines = []
++  if (systems.length) lines.push(`[system]\n${systems.join("\n\n")}`)
++  for (const m of before) lines.push(`${m.role === "assistant" ? "assistant" : "user"}: ${m.content}`)
++  const header = lines.length ? "Below is the conversation so far. Answer the final user message, continuing it.\n\n" : ""
++  return header + lines.join("\n\n") + (lines.length ? "\n\n" : "") + `user: ${lastUser?.content ?? ""}`
++}
++
++// planTurn decides what one request sends: a new room with the flattened
++// transcript, or (when the transcript continues a room we already have) only
++// the newest message, hung off the previous answer.
++function planTurn(entry, messages, now = Date.now()) {
++  const history = historyOf(messages)
++  if (entry && now - entry.at < ROOM_TTL && history.length > entry.sent.length) {
++    const continues = entry.sent.every((m, i) => history[i]?.role === m.role && history[i]?.content === m.content)
++    const added = history.slice(entry.sent.length)
++    const lastUser = [...added].reverse().find((m) => m.role === "user")
++    if (continues && lastUser && added.length <= 2) {
++      return { room: entry.room, parent: entry.parent, content: lastUser.content, history }
++    }
++  }
++  return { room: null, parent: null, content: flatten(history), history }
++}
++
++function estimateTokens(text) {
++  return Math.max(1, Math.ceil(String(text ?? "").length / 4))
++}
++
++// Tabbit names a cycle with bare dates ("2026.11.03"), in Beijing time.
++function parseCycleDate(value) {
++  const m = clean(value).match(/^(\d{4})\.(\d{2})\.(\d{2})$/)
++  if (!m) return undefined
++  const date = new Date(`${m[1]}-${m[2]}-${m[3]}T00:00:00+08:00`)
++  return Number.isNaN(date.getTime()) ? undefined : date.toISOString()
++}
++
++function usageWindow(data) {
++  const pct = Number.parseFloat(String(data?.usage_percentage ?? "").replace("%", ""))
++  const start = parseCycleDate(data?.current_cycle_start)
++  const end = parseCycleDate(data?.current_cycle_end)
++  return {
++    name: "Cycle usage",
++    ...(Number.isFinite(pct) ? { used: Math.max(0, pct) } : {}),
++    amount: Number.isFinite(pct) ? pct : 0,
++    limit: 100,
++    unit: "%",
++    display: Number.isFinite(pct) ? `${pct.toFixed(2)}%` : "",
++    ...(start ? { startsAt: start } : {}),
++    ...(end ? { resetsAt: end } : {}),
++  }
++}
++
++function freeOnly() {
++  try {
++    return globalThis.magpie?.option?.(ID, FREE_ONLY) === true
++  } catch {
++    return false
++  }
++}
++
++// ---- the wire between magpie and Tabbit ---------------------------------
++
++function chunkLine(model, delta, { finish = null, usage = null } = {}) {
++  const chunk = {
++    id: `chatcmpl-tabbit-${Date.now().toString(36)}`,
++    object: "chat.completion.chunk",
++    created: Math.floor(Date.now() / 1000),
++    model,
++    choices: [{ index: 0, delta, finish_reason: finish }],
++  }
++  if (usage) chunk.usage = usage
++  return `data: ${JSON.stringify(chunk)}\n\n`
++}
++
++function completionBody(model, text, reasoning, usage) {
++  return {
++    id: `chatcmpl-tabbit-${Date.now().toString(36)}`,
++    object: "chat.completion",
++    created: Math.floor(Date.now() / 1000),
++    model,
++    choices: [
++      {
++        index: 0,
++        message: { role: "assistant", content: text, ...(reasoning ? { reasoning_content: reasoning } : {}) },
++        finish_reason: "stop",
++      },
++    ],
++    ...(usage ? { usage } : {}),
++  }
++}
++
++// errorResponse carries the sign-in state magpie reads: `X-Magpie-Sign-In:
++// expired` marks the account, and a 403 with code 492 leaves it alone (the
++// model isn't on the plan; the sign-in is fine).
++function errorResponse(error) {
++  const status = Number.isFinite(error?.status) ? error.status : 500
++  const headers = { "content-type": "application/json" }
++  if (error?.signIn) headers["x-magpie-sign-in"] = error.signIn
++  const passthrough = status === 401 || status === 403
++  return new Response(
++    JSON.stringify({
++      error: {
++        message: error?.message ?? String(error),
++        type: error?.signIn === "expired" ? "authentication_error" : "tabbit_error",
++        ...(error?.code !== undefined ? { code: error.code } : {}),
++      },
++    }),
++    { status: passthrough ? status : 502, headers },
++  )
++}
++
++// streamTurn writes one joined turn out as OpenAI chunk lines. `onCancel`
++// ends the run at Tabbit when the client goes away early: the turn keeps
++// producing for a while otherwise, and the account pays for it.
++function streamTurn(response, { model, plan, body, signal, onEnd, onCancel }) {
++  const encoder = new TextEncoder()
++  return new ReadableStream({
++    async start(controller) {
++      const send = (text) => controller.enqueue(encoder.encode(text))
++      let text = ""
++      try {
++        send(chunkLine(model, { role: "assistant", content: "" }))
++        for await (const part of turnDeltas(response, { signal })) {
++          if (part.type === "thinking" && part.value) send(chunkLine(model, { reasoning_content: part.value }))
++          else if (part.type === "text" && part.value) {
++            text += part.value
++            send(chunkLine(model, { content: part.value }))
++          } else if (part.type === "end") {
++            if (part.state.failed) throw new TabbitError(`Tabbit's turn failed: ${JSON.stringify(part.state.failed).slice(0, 300)}`)
++            const usage = body?.stream_options?.include_usage
++              ? {
++                  prompt_tokens: estimateTokens(plan.content),
++                  completion_tokens: estimateTokens(text),
++                  total_tokens: estimateTokens(plan.content) + estimateTokens(text),
++                }
++              : null
++            send(chunkLine(model, {}, { finish: part.state.truncated ? "length" : "stop", usage }))
++            send("data: [DONE]\n\n")
++            onEnd?.(part.state)
++          }
++        }
++      } catch (error) {
++        // A stream that has already started can't change its status, so the
++        // failure goes out as an event and the stream ends.
++        send(`data: ${JSON.stringify({ error: { message: error?.message ?? String(error), type: "tabbit_error" } })}\n\n`)
++        send("data: [DONE]\n\n")
++      } finally {
++        try {
++          controller.close()
++        } catch {
++          /* already closed */
++        }
++      }
++    },
++    async cancel() {
++      try {
++        await onCancel?.()
++      } catch {
++        /* stopping is best effort */
++      }
++    },
++  })
++}
++
++// ---- the plugin ---------------------------------------------------------
++
++function createPlugin() {
++  async function chat(getAuth, request) {
++    const body = await request.json()
++    const model = stripModel(body?.model)
++    if (!model) throw new TabbitError("tabbit: no model was named", { status: 400 })
++    const messages = Array.isArray(body?.messages) ? body.messages : []
++    if (!messages.length) throw new TabbitError("tabbit: no messages were sent", { status: 400 })
++
++    const auth = await getAuth()
++    const creds = credsOf(auth)
++    if (!creds) throw Object.assign(new TabbitError("tabbit: not signed in", { status: 401 }), { signIn: "expired" })
++
++    const session = sessionOf(request.headers)
++    const plan = planTurn(rooms.get(session), messages)
++
++    const start = async (roomId, parentMessageId) => {
++      await runTurn(creds, roomId, { content: plan.content, model, parentMessageId, signal: request.signal })
++      return await join(creds, roomId, { signal: request.signal })
++    }
++
++    let response = null
++    if (plan.room) {
++      try {
++        response = await start(plan.room, plan.parent)
++      } catch (error) {
++        // A room that has been reset or dropped is replaced, not reported:
++        // the transcript flattens the same way a new room needs.
++        if (![400, 404, 409].includes(error?.status)) throw error
++        plan.content = flatten(plan.history)
++        plan.room = null
++      }
++    }
++    let room = plan.room
++    if (!room) {
++      room = await createRoom(creds, request.signal)
++      response = await start(room, null)
++    }
++
++    if (body?.stream === true) {
++      const stream = streamTurn(response, {
++        model,
++        plan,
++        body,
++        signal: request.signal,
++        onEnd: (state) => remember(session, room, plan.history, state?.assistantMessageId ?? null),
++        onCancel: () => stop(creds, room, request.signal),
++      })
++      return new Response(stream, {
++        status: 200,
++        headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" },
++      })
++    }
++
++    // Not streaming: drain the turn, then answer once.
++    let text = ""
++    let reasoning = ""
++    let assistantId = null
++    for await (const part of turnDeltas(response, { signal: request.signal })) {
++      if (part.type === "text") text += part.value
++      else if (part.type === "thinking") reasoning += part.value
++      else if (part.type === "end") {
++        assistantId = part.state.assistantMessageId
++        if (part.state.failed) throw new TabbitError(`Tabbit's turn failed: ${JSON.stringify(part.state.failed).slice(0, 300)}`)
++        if (part.state.truncated) throw new TabbitError("Tabbit's turn was cut before it finished")
++      }
++    }
++    remember(session, room, plan.history, assistantId)
++    return Response.json(
++      completionBody(model, text, reasoning, {
++        prompt_tokens: estimateTokens(plan.content),
++        completion_tokens: estimateTokens(text),
++        total_tokens: estimateTokens(plan.content) + estimateTokens(text),
++      }),
++    )
++  }
++
++  function remember(session, room, history, parent) {
++    if (!session) return
++    rooms.set(session, { room, parent, sent: history, at: Date.now() })
++  }
++
++  return {
++    async config(cfg) {
++      cfg.provider ??= {}
++      cfg.provider[ID] ??= {}
++      const provider = cfg.provider[ID]
++      provider.name ??= NAME
++      provider.npm ??= NPM
++      provider.api ??= CHAT_BASE
++      // The bootstrap rows fill in whatever the user hasn't pinned.
++      provider.models = { ...rowsOf(BOOTSTRAP), ...(provider.models ?? {}) }
++    },
++
++    // The session id the room is keyed by, when magpie names one.
++    "chat.headers": async (input, output) => {
++      const providerId = input?.model?.providerID ?? input?.provider?.info?.id
++      if (providerId !== ID || !input?.sessionID) return
++      output.headers[SESSION] = String(input.sessionID).slice(0, 128)
++    },
++
++    provider: {
++      id: ID,
++      async models(provider, { auth } = {}) {
++        const creds = credsOf(auth)
++        if (!creds) return provider.models
++        let catalog
++        try {
++          catalog = await listModels(creds)
++        } catch (error) {
++          if (error?.signIn) throw error
++          return provider.models
++        }
++        const rows = rowsOf(catalog, { freeOnly: freeOnly() })
++        return Object.keys(rows).length ? rows : provider.models
++      },
++    },
++
++    auth: {
++      provider: ID,
++      maxConcurrency: 1,
++      async loader(getAuth) {
++        return {
++          baseURL: CHAT_BASE,
++          apiKey: "",
++          async fetch(input, init) {
++            const request = new Request(input, init)
++            const path = new URL(request.url).pathname
++            if (request.method !== "POST" || !path.endsWith("/chat/completions")) {
++              throw new TabbitError(`tabbit: ${request.method} ${path} is not served by this provider`, { status: 404 })
++            }
++            try {
++              return await chat(getAuth, request)
++            } catch (error) {
++              return errorResponse(error)
++            }
++          },
++        }
++      },
++
++      options: [
++        {
++          key: FREE_ONLY,
++          label: "Free models only",
++          description:
++            "Lists only the models Tabbit serves at no credit cost (free_unlimited and free_metered). A premium-only model is left out instead of failing at the turn.",
++          labels: { zh: "仅免费模型" },
++          descriptions: {
++            zh: "只列出 Tabbit 不消耗额度的模型（free_unlimited 与 free_metered）。付费专属的模型直接不出现，而不是等请求时被 403 拒绝。",
++          },
++          filtersModels: true,
++        },
++      ],
++
++      methods: [
++        {
++          type: "oauth",
++          label: "Read Tabbit Browser sign-in (macOS)",
++          authorize: () => ({
++            url: "",
++            instructions: "Reads the sign-in Tabbit Browser already has on this computer. Nothing is copied by hand.",
++            method: "auto",
++            callback: async () => {
++              try {
++                const sign = desktopSignIn()
++                return { type: "success", key: sign.key, accountId: sign.userId, metadata: { userId: sign.userId, source: "desktop" } }
++              } catch (error) {
++                return { type: "failed", error: String(error?.message ?? error) }
++              }
++            },
++          }),
++        },
++        {
++          type: "api",
++          label: "Paste Tabbit token (the browser's `token` cookie)",
++          placeholder: "eyJhbGci…",
++        },
++      ],
++
++      // The daily sign-in: magpie runs it once a day per account while the
++      // user has it on, and draws the outcome on the account's card. A throw
++      // is a failure magpie retries on its own backoff; a returned "failed"
++      // waits for its longer one. Tabbit's sign-in is the desktop pet's
++      // activity, and today it is the only scene the service takes.
++      async checkin(getAuth) {
++        const auth = await getAuth()
++        const creds = credsOf(auth)
++        if (!creds) return { outcome: "failed", message: "tabbit: not signed in" }
++        return await checkinOf(creds)
++      },
++
++      async usage(getAuth) {
++        const auth = await getAuth()
++        const creds = credsOf(auth)
++        if (!creds) return { windows: [] }
++        try {
++          const data = await readUsage(creds)
++          const level = clean(data?.member_level)
++          return {
++            plan: level ? `Tabbit ${level}` : "Tabbit",
++            windows: [usageWindow(data)],
++            ...(auth?.metadata?.userId || creds.uid ? { accountId: auth?.metadata?.userId || creds.uid } : {}),
++            ...(expiresAt(auth) ? { expiresAt: expiresAt(auth) } : {}),
++            ...(stale(auth) ? { error: "This sign-in has expired; read it again", signIn: "expired" } : {}),
++          }
++        } catch (error) {
++          return { error: error?.message ?? String(error), signIn: error?.signIn, windows: [] }
++        }
++      },
++    },
++  }
++}
++
++// The plugin function. magpie calls every exported function as a plugin, so
++// the internals stay reachable through `_internal` only.
++export const TabbitPlugin = async () => createPlugin()
++
++export const _internal = {
++  createPlugin,
++  planTurn,
++  historyOf,
++  flatten,
++  stripModel,
++  contentOf,
++  usageWindow,
++  parseCycleDate,
++  estimateTokens,
++  rooms,
++}
+diff --git a/packages/tabbit/opencode.mjs b/packages/tabbit/opencode.mjs
+new file mode 100644
+index 0000000..ef310eb
+--- /dev/null
++++ b/packages/tabbit/opencode.mjs
+@@ -0,0 +1,4 @@
++// The OpenCode 1.x (and magpie) face of the package: the plugin functions and
++// nothing else. OpenCode 1.x refuses a main whose exports include anything
++// that isn't a plugin, so helpers stay in index.mjs / src.
++export { TabbitPlugin } from "./index.mjs"
+diff --git a/packages/tabbit/opencode2.mjs b/packages/tabbit/opencode2.mjs
+new file mode 100644
+index 0000000..7aa300b
+--- /dev/null
++++ b/packages/tabbit/opencode2.mjs
+@@ -0,0 +1,594 @@
++// The OpenCode 2.x face of a package whose plugins are written for
++// OpenCode 1.x (and magpie's plugin host).
++//
++// OpenCode 2.x loads a package's `exports["."]` and wants its default to be
++// {id, setup(ctx)}; it has no fallback for a 1.x plugin's named functions
++// (plugins#657). This file is that default. It runs each 1.x plugin the
++// package's opencode.mjs exports and hands 2.x what the plugin's hooks say:
++//
++//   auth.methods     → the integration's sign-in methods
++//   config()         → the provider, its package, base URL and models
++//   provider.models  → the signed-in account's own model list
++//   auth.loader      → each request's base URL, key, headers and fetch
++//
++// What 2.x has no place for is left out: chat.headers and chat.params
++// (2.x's sdk hook doesn't carry the session), magpie's usage and checkin,
++// tools and events.
++//
++// scripts/opencode2.mjs is the one copy that is edited. Every package that
++// has it carries the same bytes as packages/<name>/opencode2.mjs, and
++// scripts/check.mjs fails when a copy differs.
++
++import { readFileSync } from "node:fs"
++import * as v1 from "./opencode.mjs"
++
++const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8"))
++
++// The key the SDK is made with: the account's own goes on each request in
++// its place (see wrapFetch), so a key read when the SDK was made can't go
++// out after the account changed.
++const PLACEHOLDER = "opencode2-v1-key"
++
++// The SDK package a 1.x npm name runs as on 2.x. A version keeps 2.x from
++// swapping @ai-sdk/* for its native providers, which never call the sdk
++// hook below; openai-compatible's is the one 2.x ships, the others are AI
++// SDK v6's dist-tag, the line 2.x's bridge runs.
++export function packageOf(npm) {
++  const name = npm || "@ai-sdk/openai-compatible"
++  if (name === "@ai-sdk/openai-compatible") return "aisdk:@ai-sdk/openai-compatible@2.0.41"
++  if (/^@ai-sdk\/[^/@]+$/.test(name)) return `aisdk:${name}@ai-v6`
++  return `aisdk:${name}`
++}
++
++// The plugins a 1.x module exports, as magpie's host and OpenCode 1.x read
++// them: a default {server} is the one plugin, else every function export
++// and every {server} object.
++export function pluginsOf(mod) {
++  const d = mod?.default
++  if (d && typeof d === "object" && ("server" in d || "id" in d || "tui" in d))
++    return typeof d.server === "function" ? [d.server] : []
++  const out = []
++  for (const value of Object.values(mod ?? {})) {
++    const fn = typeof value === "function" ? value : value && typeof value === "object" && typeof value.server === "function" ? value.server : null
++    if (fn && !out.includes(fn)) out.push(fn)
++  }
++  return out
++}
++
++const int = (n, fallback = 0) => {
++  const v = Math.trunc(Number(n))
++  return Number.isFinite(v) && v >= 0 ? v : fallback
++}
++const money = (n) => (Number.isFinite(Number(n)) && Number(n) >= 0 ? Number(n) : 0)
++const record = (v) => (v && typeof v === "object" && !Array.isArray(v) ? v : {})
++const json = (v) => {
++  try {
++    return JSON.parse(JSON.stringify(v ?? null))
++  } catch {
++    return null
++  }
++}
++const strings = (v) => Object.fromEntries(Object.entries(record(v)).filter(([, s]) => typeof s === "string"))
++const nonEmpty = (o) => (Object.keys(o).length ? o : undefined)
++
++// connKey names a connection the way 2.x does.
++const connKey = (c) => (!c ? "" : c.type === "credential" ? `credential:${c.id}` : `env:${c.name}`)
++
++// ---- sign-in ------------------------------------------------------------
++
++// fields is a 1.x method's prompts as a 2.x form.
++export function fieldsOf(prompts) {
++  const out = []
++  for (const p of prompts ?? []) {
++    if (!p?.key) continue
++    const f = { key: String(p.key), type: "string", title: String(p.message ?? p.key) }
++    if (p.placeholder) f.placeholder = String(p.placeholder)
++    if (p.type === "select" && Array.isArray(p.options))
++      f.options = p.options.map((o) => ({ value: String(o.value), label: String(o.label ?? o.value), ...(o.hint ? { description: String(o.hint) } : {}) }))
++    // a prompt shown only when another answer says so can't be required
++    if (!p.condition) f.required = true
++    out.push(f)
++  }
++  return out.length ? out : undefined
++}
++
++// v1Saved is what a 1.x sign-in's success is saved as, the way 1.x writes
++// auth.json: the result without its type and provider.
++function v1Saved(r) {
++  const { type: _t, provider: _p, ...rest } = r
++  if ("key" in r) return { type: "api", ...rest }
++  return { type: "oauth", ...rest }
++}
++
++// credentialOf is a 1.x sign-in's success as a 2.x credential: OAuth for
++// both kinds, the 1.x auth kept whole in its metadata. No refresh is
++// registered, so 2.x hands the credential over as it is and the plugin's
++// own loader renews it, as it does on 1.x.
++export function credentialOf(methodID, r) {
++  if (!r || r.type !== "success") throw new Error(r?.error || r?.message || "the sign-in failed")
++  const saved = json(v1Saved(r))
++  if (saved.type === "api")
++    return { type: "oauth", methodID, access: String(saved.key ?? ""), refresh: "", expires: 0, metadata: { v1: saved } }
++  return {
++    type: "oauth",
++    methodID,
++    access: String(saved.access ?? ""),
++    refresh: String(saved.refresh ?? ""),
++    expires: int(saved.expires),
++    metadata: { v1: saved },
++  }
++}
++
++// authOfValue is the 1.x auth a 2.x credential stands for.
++export function authOfValue(value) {
++  if (!value) return null
++  if (value.type === "oauth") {
++    const v1 = record(value.metadata).v1
++    if (v1 && typeof v1 === "object") return v1
++    return { type: "oauth", access: value.access, refresh: value.refresh, expires: value.expires }
++  }
++  if (value.type === "key") {
++    const meta = value.metadata && Object.keys(value.metadata).length ? { metadata: value.metadata } : {}
++    return { type: "api", key: value.key, ...meta }
++  }
++  return null
++}
++
++const fingerprint = (a) => JSON.stringify([a?.type, a?.access ?? a?.key ?? "", a?.refresh ?? ""])
++
++// ---- models -------------------------------------------------------------
++
++const MODALITIES = ["text", "audio", "image", "video", "pdf"]
++
++// internalOf is a config model as 1.x hands it to provider.models: what
++// fromModelsDevModel makes of it, with the config's own variants.
++export function internalOf(providerID, conf, key, m) {
++  const mods = record(m.modalities)
++  const has = (list, k) => Array.isArray(list) && list.includes(k)
++  const cost = record(m.cost)
++  return {
++    ...m,
++    id: key,
++    providerID,
++    name: m.name ?? key,
++    api: { id: m.id ?? key, url: m.provider?.api ?? conf.api ?? conf.options?.baseURL ?? "", npm: m.provider?.npm ?? conf.npm ?? "@ai-sdk/openai-compatible" },
++    status: m.status ?? "active",
++    headers: m.headers ?? {},
++    options: m.options ?? {},
++    cost: { input: money(cost.input), output: money(cost.output), cache: { read: money(cost.cache_read), write: money(cost.cache_write) } },
++    limit: { context: int(m.limit?.context), input: m.limit?.input, output: int(m.limit?.output) },
++    capabilities: {
++      temperature: m.temperature ?? false,
++      reasoning: m.reasoning ?? false,
++      attachment: m.attachment ?? false,
++      toolcall: m.tool_call ?? true,
++      input: Object.fromEntries(MODALITIES.map((k) => [k, mods.input ? has(mods.input, k) : k === "text"])),
++      output: Object.fromEntries(MODALITIES.map((k) => [k, mods.output ? has(mods.output, k) : k === "text"])),
++      interleaved: m.interleaved ?? false,
++    },
++    release_date: m.release_date ?? "",
++    variants: record(m.variants),
++  }
++}
++
++// modelOf is a 1.x model, in config or internal form, as a 2.x Model.Info.
++export function modelOf(providerID, provider, key, m) {
++  const caps = record(m.capabilities)
++  const listFrom = (obj, list) => {
++    if (obj && typeof obj === "object") return MODALITIES.filter((k) => obj[k])
++    if (Array.isArray(list)) return list.map(String)
++    return ["text"]
++  }
++  const input = listFrom(caps.input, m.modalities?.input)
++  const output = listFrom(caps.output, m.modalities?.output)
++  const c = record(m.cost)
++  const cache = record(c.cache)
++  const npm = m.api?.npm ?? m.provider?.npm
++  const url = m.api?.url ?? m.provider?.api
++  const settings = { ...record(json(m.options)) }
++  if (url && url !== provider.baseURL) settings.baseURL = url
++  const variants = Object.entries(record(m.variants))
++    .filter(([, v]) => !record(v).disabled)
++    .map(([id, v]) => {
++      const { disabled: _d, ...rest } = record(json(v))
++      return nonEmpty(rest) ? { id, settings: rest } : { id }
++    })
++  const status = ["alpha", "beta", "deprecated", "active"].includes(m.status) ? m.status : "active"
++  const out = {
++    id: key,
++    modelID: String(m.api?.id ?? m.id ?? key),
++    providerID,
++    name: String(m.name ?? key),
++    capabilities: {
++      tools: caps.toolcall ?? m.tool_call ?? true,
++      input: input.length ? input : ["text"],
++      output: output.length ? output : ["text"],
++      ...(typeof (caps.temperature ?? m.temperature) === "boolean" ? { temperature: caps.temperature ?? m.temperature } : {}),
++    },
++    variants,
++    time: { released: Date.parse(m.release_date ?? "") || 0 },
++    cost: [{ input: money(c.input), output: money(c.output), cache: { read: money(cache.read ?? c.cache_read), write: money(cache.write ?? c.cache_write) } }],
++    status,
++    enabled: true,
++    limit: { context: int(m.limit?.context, 128000) || 128000, output: int(m.limit?.output, 8192) || 8192 },
++  }
++  if (m.limit?.input) out.limit.input = int(m.limit.input)
++  if (npm && npm !== provider.npm) out.package = packageOf(npm)
++  if (nonEmpty(settings)) out.settings = settings
++  const headers = strings(m.headers)
++  if (nonEmpty(headers)) out.headers = headers
++  return out
++}
++
++// ---- requests -----------------------------------------------------------
++
++const urlOf = (input) => (typeof input === "string" ? input : input instanceof URL ? input.href : input?.url ?? String(input))
++
++// wrapFetch sends a request the SDK made from the provider's settings the
++// way 1.x would have sent it with the loader's options: the loader's base
++// URL in place of the configured one, the account's key in place of the
++// placeholder, the loader's headers added, through the loader's fetch.
++export function wrapFetch(next, base, options) {
++  return async (input, init = {}) => {
++    const o = await options()
++    let url = urlOf(input)
++    const from = String(base ?? "").replace(/\/+$/, "")
++    const to = o.baseURL ? String(o.baseURL).replace(/\/+$/, "") : ""
++    if (from && to && from !== to && url.startsWith(from)) url = to + url.slice(from.length)
++    const req = input instanceof Request ? input : null
++    const headers = new Headers(init.headers ?? req?.headers ?? undefined)
++    for (const [k, v] of [...headers.entries()]) {
++      if (!v.includes(PLACEHOLDER)) continue
++      if (o.key) headers.set(k, v.replaceAll(PLACEHOLDER, o.key))
++      else headers.delete(k)
++    }
++    for (const [k, v] of Object.entries(strings(o.headers))) headers.set(k, v)
++    const send = typeof o.fetch === "function" ? o.fetch : next ?? fetch
++    if (req && init.body === undefined) {
++      const body = req.method === "GET" || req.method === "HEAD" ? undefined : await req.text()
++      return send(url, { method: req.method, headers, body, signal: init.signal ?? req.signal })
++    }
++    return send(url, { ...init, headers })
++  }
++}
++
++// ---- one plugin ---------------------------------------------------------
++
++async function setupPlugin(ctx, fn, live) {
++  const directory = ctx?.location?.directory ?? process.cwd()
++  // the active account each provider was last read for, and the renewed
++  // auth a plugin saved for it (2.x has no way for a plugin to write a
++  // credential back, so it is kept in the plugin's storage, under the
++  // credential it renews and the token it was renewed from)
++  const current = new Map()
++  const saved = new Map()
++  const signingIn = new Map()
++  const storeKey = (id, key) => `v1auth/${id}/${key}`
++
++  const client = {
++    auth: {
++      async set(arg) {
++        const id = arg?.path?.id
++        const body = json(arg?.body)
++        const cur = id && current.get(id)
++        // a sign-in's own saves belong to the credential it is about to
++        // make, not the one that was active when it started
++        if (!cur || !body || signingIn.get(id) > 0) return { data: true }
++        const entry = { fp: cur.fp, auth: body }
++        saved.set(storeKey(id, cur.key), entry)
++        await Promise.resolve()
++          .then(() => ctx.storage?.set?.(storeKey(id, cur.key), entry))
++          .catch(() => {})
++        return { data: true }
++      },
++      async get() {
++        return { data: undefined }
++      },
++    },
++    app: { log: async () => ({ data: true }) },
++  }
++
++  const hooks = (await fn({ client, directory, worktree: directory, project: {}, serverUrl: undefined, $: undefined }, {})) ?? {}
++  const cfg = { provider: {} }
++  try {
++    await hooks.config?.(cfg)
++  } catch {}
++  const auth = hooks.auth
++  const authID = auth?.provider ? String(auth.provider) : undefined
++  const providers = record(cfg.provider)
++
++  // getAuth reads the active account: the credential 2.x holds, or what the
++  // plugin last saved renewing it.
++  const getAuth = async (id) => {
++    const connection = await ctx.integration.connection.active(id).catch(() => undefined)
++    if (!connection) {
++      current.delete(id)
++      return undefined
++    }
++    const value = await ctx.integration.connection.resolve(connection).catch(() => undefined)
++    const base = authOfValue(value)
++    if (!base) {
++      current.delete(id)
++      return undefined
++    }
++    const key = connKey(connection)
++    const fp = fingerprint(base)
++    // ours: a credential one of this plugin's own sign-ins made
++    const ours = value?.type === "oauth" && !!record(value.metadata).v1
++    current.set(id, { key, fp, ours })
++    const sk = storeKey(id, key)
++    let entry = saved.get(sk)
++    if (!entry) {
++      entry = await Promise.resolve()
++        .then(() => ctx.storage?.get?.(sk))
++        .catch(() => undefined)
++      if (entry) saved.set(sk, entry)
++    }
++    return entry && entry.fp === fp && entry.auth ? entry.auth : base
++  }
++
++  // the sign-in methods
++  if (authID && Array.isArray(auth.methods) && auth.methods.length) {
++    const label = (c) => {
++      const a = authOfValue(c)
++      const name = a?.name ?? a?.email ?? a?.metadata?.name ?? a?.metadata?.email ?? a?.account
++      return typeof name === "string" && name ? name : undefined
++    }
++    const begin = () => signingIn.set(authID, (signingIn.get(authID) ?? 0) + 1)
++    const end = () => signingIn.set(authID, Math.max(0, (signingIn.get(authID) ?? 1) - 1))
++    const title = record(providers[authID]).name
++    // 2.x runs a transform again on every reload, from nothing
++    await ctx.integration.transform((editor) => {
++      let keyed = false
++      // the integration 2.x makes for an id it doesn't know is named by the
++      // id; the provider's own name reads better in the sign-in list
++      if (typeof title === "string" && title)
++        try {
++          editor.update?.(authID, (i) => {
++            if (i && (!i.name || i.name === authID)) i.name = title
++          })
++        } catch {}
++      auth.methods.forEach((m, i) => {
++        if (!m) return
++        const methodID = `v1-${i}`
++        const form = fieldsOf(m.prompts)
++        if (m.type === "api" && typeof m.authorize !== "function") {
++          if (keyed) return
++          keyed = true
++          editor.method.update({ integrationID: authID, method: { type: "key", label: String(m.label ?? "API key"), ...(form ? { form } : {}) } })
++          return
++        }
++        if (typeof m.authorize !== "function") return
++        editor.method.update({
++          integrationID: authID,
++          method: { id: methodID, type: "oauth", label: String(m.label ?? authID), ...(form ? { form } : {}) },
++          async authorize(answer) {
++            begin()
++            let ended = false
++            const done = () => {
++              if (!ended) end()
++              ended = true
++            }
++            try {
++              const inputs = Object.fromEntries(Object.entries(record(answer)).map(([k, v]) => [k, String(v)]))
++              const r = await m.authorize(inputs)
++              if (m.type === "api") {
++                done()
++                return { url: "", instructions: "", mode: "auto", callback: Promise.resolve().then(() => credentialOf(methodID, r)) }
++              }
++              if (r?.method === "code")
++                return {
++                  url: String(r.url ?? ""),
++                  instructions: String(r.instructions ?? ""),
++                  mode: "code",
++                  callback: async (code) => {
++                    try {
++                      return credentialOf(methodID, await r.callback(code))
++                    } finally {
++                      done()
++                    }
++                  },
++                }
++              const callback = Promise.resolve()
++                .then(() => r.callback())
++                .then((res) => credentialOf(methodID, res))
++                .finally(done)
++              callback.catch(() => {})
++              return { url: String(r?.url ?? ""), instructions: String(r?.instructions ?? ""), mode: "auto", callback }
++            } catch (e) {
++              done()
++              throw e
++            }
++          },
++          label,
++        })
++      })
++    })
++  }
++
++  // the loader's options for the account signed in now, read again when
++  // the account changes
++  let loaded = null
++  const loaderOptions = async (id) => {
++    if (id !== authID || typeof auth?.loader !== "function") {
++      const a = authID === id ? await getAuth(id) : undefined
++      return { key: a?.type === "api" ? a.key : undefined }
++    }
++    const a = await getAuth(id)
++    if (!a) return {}
++    const fp = current.get(id)?.key + "\0" + fingerprint(a)
++    if (loaded?.fp !== fp) {
++      const p = Promise.resolve()
++        .then(() => auth.loader(() => getAuth(id), providerOf(id)))
++        .then((o) => record(o))
++      loaded = { fp, p }
++      p.catch(() => {
++        if (loaded?.fp === fp) loaded = null
++      })
++    }
++    const o = await loaded.p
++    const key = typeof o.apiKey === "string" && o.apiKey ? o.apiKey : a.type === "api" ? a.key : undefined
++    return { baseURL: o.baseURL, key, headers: o.headers, fetch: o.fetch }
++  }
++
++  // the providers, with the list the account's own read last gave each
++  const source = new Map()
++  // providerOf is a provider as 1.x hands it to provider.models and
++  // auth.loader
++  const providerOf = (id) => {
++    const conf = record(providers[id])
++    const models = Object.fromEntries(Object.entries(record(conf.models)).map(([k, m]) => [k, internalOf(id, conf, k, record(m))]))
++    return { id, name: conf.name ?? id, source: "config", env: [], options: record(conf.options), models }
++  }
++  const listed = new Set()
++  for (const [id, conf0] of Object.entries(providers)) {
++    const conf = record(conf0)
++    // a provider entry that only names the sign-in (no package, no models)
++    // is not a provider of models
++    if (!conf.npm && !Object.keys(record(conf.models)).length) continue
++    const options = record(conf.options)
++    const { apiKey: _k, baseURL: _b, fetch: _f, headers: optHeaders, ...rest } = options
++    // with no base URL the config leaves it to the loader: a name that
++    // can't resolve stands in for it, and each request swaps in the
++    // loader's (wrapFetch)
++    const baseURL = options.baseURL ?? conf.api ?? `https://${id.replace(/[^a-z0-9-]/gi, "-")}.opencode2-v1.invalid`
++    const npm = conf.npm ?? "@ai-sdk/openai-compatible"
++    const info = {
++      id,
++      ...(id === authID ? { integrationID: id } : {}),
++      name: String(conf.name ?? id),
++      activation: "auto",
++      package: packageOf(npm),
++      settings: { ...record(json(rest)), ...(baseURL ? { baseURL: String(baseURL) } : {}) },
++    }
++    const headers = { ...strings(conf.headers), ...strings(optHeaders) }
++    if (nonEmpty(headers)) info.headers = headers
++    const prov = { baseURL, npm }
++    const fromConfig = () =>
++      Object.entries(record(conf.models)).map(([key, m]) => modelOf(id, prov, key, internalOf(id, conf, key, record(m))))
++    listed.add(id)
++    await ctx.provider.transform((editor) => {
++      const s = source.get(id)
++      editor.add({ info, models: s?.models ?? fromConfig(), sourceConnection: s?.connection })
++    })
++    source.set(id, { conf, prov, models: null, connection: undefined })
++  }
++
++  // each request: the placeholder key, and the fetch that swaps in the
++  // account's. A provider the package doesn't list (one 2.x has built in
++  // that the plugin only signs in to) is left to 2.x unless the plugin's
++  // loader serves it and one of the plugin's own sign-ins is active.
++  const own = authID && !listed.has(authID) && typeof auth?.loader === "function" ? [authID] : []
++  for (const id of new Set([...listed, ...own])) {
++    const base = source.get(id)?.prov.baseURL
++    await ctx.aisdk.hook(
++      "sdk",
++      async (evt) => {
++        const opts = evt.options
++        if (!opts || opts.__opencode2) return
++        if (!listed.has(id)) {
++          await getAuth(id)
++          if (!current.get(id)?.ours) return
++        }
++        opts.__opencode2 = true
++        opts.apiKey = PLACEHOLDER
++        opts.fetch = wrapFetch(opts.fetch, opts.baseURL ?? base, () => loaderOptions(id))
++      },
++      { providerID: id },
++    )
++  }
++
++  // refresh reads the account's own list after a sign-in or a switch
++  const listID = hooks.provider?.id ? String(hooks.provider.id) : undefined
++  let refreshing = null
++  let again = false
++  // the account the list was last read for: a credential.updated that
++  // leaves it as it was reads nothing again
++  let readFor = null
++  const stateOf = async () => {
++    const c = await ctx.integration.connection.active(authID).catch(() => undefined)
++    const a = c ? await getAuth(authID) : undefined
++    return connKey(c) + "\0" + (a ? fingerprint(a) : "")
++  }
++  const refresh = () => {
++    if (refreshing) {
++      again = true
++      return refreshing
++    }
++    refreshing = (async () => {
++      try {
++        if (!authID || !source.has(authID)) return
++        const s = source.get(authID)
++        const connection = await ctx.integration.connection.active(authID).catch(() => undefined)
++        const a = connection ? await getAuth(authID) : undefined
++        readFor = connKey(connection) + "\0" + (a ? fingerprint(a) : "")
++        if (!a || listID !== authID || typeof hooks.provider?.models !== "function") {
++          if (s.connection || s.models) {
++            s.connection = undefined
++            s.models = null
++            await ctx.provider.reload()
++          }
++          return
++        }
++        const provider = providerOf(authID)
++        let got
++        try {
++          got = await hooks.provider.models(provider, { auth: a })
++        } catch {
++          got = null
++        }
++        if (connKey(await ctx.integration.connection.active(authID).catch(() => undefined)) !== connKey(connection)) {
++          again = true
++          return
++        }
++        s.connection = connection
++        s.models = got && typeof got === "object" ? Object.entries(got).map(([k, m]) => modelOf(authID, s.prov, k, record(m))) : null
++        await ctx.provider.reload()
++        await ctx.model?.reload?.()
++      } finally {
++        refreshing = null
++        if (again && live.on) {
++          again = false
++          void refresh()
++        }
++      }
++    })()
++    return refreshing
++  }
++
++  if (authID && ctx.event?.subscribe)
++    void (async () => {
++      try {
++        // a switch names the integration; an update (a sign-in, a removal)
++        // names nothing, so it reads again only when this account changed
++        const types = ["credential.switched", "credential.updated"]
++        for await (const event of ctx.event.subscribe({ types })) {
++          if (!live.on) return
++          if (event?.type === "credential.switched" && event?.data?.integrationID === authID) {
++            loaded = null
++            await refresh()
++          } else if (event?.type === "credential.updated" && (await stateOf()) !== readFor) {
++            await refresh()
++          }
++        }
++      } catch {}
++    })()
++  void refresh()
++}
++
++export async function setup(ctx, mod = v1) {
++  const live = { on: true }
++  for (const fn of pluginsOf(mod)) {
++    try {
++      await setupPlugin(ctx, fn, live)
++    } catch (e) {
++      // one plugin failing to start leaves the package's others working
++      console.error(`${pkg.name}: ${e?.message ?? e}`)
++    }
++  }
++  return () => {
++    live.on = false
++  }
++}
++
++export default { id: pkg.name, setup: (ctx) => setup(ctx) }
+diff --git a/packages/tabbit/package.json b/packages/tabbit/package.json
+new file mode 100644
+index 0000000..ddc93c8
+--- /dev/null
++++ b/packages/tabbit/package.json
+@@ -0,0 +1,51 @@
++{
++  "name": "@magpie-community/opencode-tabbit-auth",
++  "version": "0.1.0",
++  "description": "Tabbit (web.tabbit.com) as a magpie / OpenCode provider: live model catalog, cookie sign-in, chat completions, cycle usage and the daily check-in",
++  "type": "module",
++  "main": "./opencode.mjs",
++  "exports": {
++    ".": "./opencode2.mjs"
++  },
++  "files": [
++    "index.mjs",
++    "opencode.mjs",
++    "opencode2.mjs",
++    "src/",
++    "README.md",
++    "LICENSE"
++  ],
++  "keywords": [
++    "magpie",
++    "magpie-plugin",
++    "opencode",
++    "opencode-plugin",
++    "tabbit",
++    "provider",
++    "llm-gateway"
++  ],
++  "license": "MIT",
++  "engines": {
++    "node": ">=22"
++  },
++  "scripts": {
++    "test": "node --test tests/"
++  },
++  "magpie": {
++    "icon": "https://web.tabbit.com/favicon.ico",
++    "maxConcurrency": 1
++  },
++  "homepage": "https://github.com/magpie-community/plugins/tree/main/packages/tabbit#readme",
++  "repository": {
++    "type": "git",
++    "url": "git+https://github.com/magpie-community/plugins.git",
++    "directory": "packages/tabbit"
++  },
++  "bugs": {
++    "url": "https://github.com/magpie-community/plugins/issues"
++  },
++  "publishConfig": {
++    "access": "public",
++    "registry": "https://registry.npmjs.org/"
++  }
++}
+diff --git a/packages/tabbit/src/api.mjs b/packages/tabbit/src/api.mjs
+new file mode 100644
+index 0000000..2d4aeb1
+--- /dev/null
++++ b/packages/tabbit/src/api.mjs
+@@ -0,0 +1,295 @@
++// Tabbit's own HTTP API, as the web app (web.tabbit.com) calls it.
++//
++// Everything here was measured against a live signed-in session:
++//
++//   GET  /proxy/v1/model_config/models?a=0&scene=chat   the live catalog
++//   POST /api/v3/chat/rooms                             a room (conversation)
++//   POST /api/v3/chat/rooms/<room>/runs                 one turn
++//   POST /api/v3/chat/rooms/<room>/join                 the turn's SSE stream
++//   GET  /api/commerce/quota/v1/usage?user_id=<uid>     the cycle's usage
++//   GET  /proxy/v0/user/base-info                       the account
++//
++// The sign-in is the `token` cookie alone: an RS256 JWT issued by
++// web.tab-browser.com with a 7-day life (exp - iat = 604800). `user_id` and
++// `managed` ride along because the app sends them, not because the server
++// needs them to authenticate.
++
++export const BASE = "https://web.tabbit.com"
++
++// A browser User-Agent is what the app sends and what the proxy answers.
++// Nothing else is required: the version gate that refuses
++// /proxy/v0/chat/completion with code 493 is not applied to these routes.
++export const UA =
++  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
++
++// The device id hash the app puts on every join. It is a constant of the
++// client, not of the account: the same 64 hex characters came back from two
++// different sessions.
++export const DEVICE_HASH =
++  "3713eb6543ed2726194a44f52cc053818ff123110f55cad8062070649ac9a40c"
++
++export const TIMEOUT = 30_000
++
++// A turn that never answers would otherwise hang the agent forever.
++export const STREAM_TIMEOUT = Number(process.env.TABBIT_STREAM_TIMEOUT_MS || 300_000)
++
++const clean = (v) => (typeof v === "string" ? v.trim() : "")
++
++export class TabbitError extends Error {
++  constructor(message, { status, code, action } = {}) {
++    super(message)
++    this.name = "TabbitError"
++    this.status = status
++    this.code = code
++    this.action = action
++  }
++}
++
++// credsOf turns whatever the account holds into the cookie header. A pasted
++// value may be the bare JWT or a whole `k=v; k=v` cookie string; both are
++// accepted, and a bare JWT is completed with the two cookies the app sends.
++export function credsOf(auth) {
++  const raw = clean(auth?.key ?? auth?.token ?? auth?.access)
++  if (!raw) return null
++  const uid = clean(auth?.userId ?? auth?.metadata?.userId)
++  let header = raw
++  if (!raw.includes("=")) {
++    const parts = [`token=${raw}`]
++    if (uid) parts.push(`user_id=${uid}`, `SAPISID=${uid}`)
++    header = parts.join("; ")
++  }
++  if (uid && !header.includes("user_id=")) header += `; user_id=${uid}`
++  const token = header.match(/(?:^|;\s*)token=([^;]+)/)?.[1]
++  if (!token) return null
++  const fromCookie = header.match(/(?:^|;\s*)user_id=([^;]+)/)?.[1] || ""
++  return { header, token, uid: uid || fromCookie || uidOfClaims(claimsOf(token)) }
++}
++
++// claimsOf reads the JWT payload without verifying it: the fields name the
++// account and say when to ask for a sign-in again, while the server is the
++// one that decides whether the token is good.
++export function claimsOf(token) {
++  try {
++    const part = String(token).split(".")[1]
++    if (!part) return null
++    const padded = part.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (part.length % 4)) % 4)
++    const json = JSON.parse(Buffer.from(padded, "base64").toString("utf8"))
++    return json && typeof json === "object" ? json : null
++  } catch {
++    return null
++  }
++}
++
++export function expiresAt(auth) {
++  const claims = claimsOf(credsOf(auth)?.token)
++  return Number.isFinite(claims?.exp) ? new Date(claims.exp * 1000).toISOString() : undefined
++}
++
++// uidOfClaims reads the account id a token names: `sub` and `id` carry the
++// same uuid in the token the browser keeps.
++export function uidOfClaims(claims) {
++  const id = claims?.sub ?? claims?.id ?? ""
++  return typeof id === "string" ? id : ""
++}
++
++// stale is a token past its own exp. It is only a hint: the server is asked
++// anyway, and its refusal is what marks the account.
++export function stale(auth, skewMs = 60_000) {
++  const claims = claimsOf(credsOf(auth)?.token)
++  if (!Number.isFinite(claims?.exp)) return false
++  return claims.exp * 1000 - skewMs <= Date.now()
++}
++
++function headersFor(creds, extra) {
++  return {
++    cookie: creds.header,
++    accept: "application/json",
++    "user-agent": UA,
++    origin: BASE,
++    referer: `${BASE}/newtab`,
++    ...extra,
++  }
++}
++
++function safeJSON(text) {
++  try {
++    return JSON.parse(text)
++  } catch {
++    return null
++  }
++}
++
++async function call(creds, path, init = {}, signal) {
++  const res = await fetch(BASE + path, {
++    ...init,
++    headers: headersFor(creds, init.headers),
++    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(TIMEOUT)]) : AbortSignal.timeout(TIMEOUT),
++    redirect: "error",
++  })
++  if (res.status === 401 || res.status === 403) {
++    let body = ""
++    try {
++      body = await res.text()
++    } catch {
++      /* the status is enough */
++    }
++    const parsed = safeJSON(body)
++    // The refusal nests the code two ways: {"detail":{"message","details":{"code"}}}
++    // on /api/v3, {"code"...} at the top on some routes.
++    const detail = parsed?.detail ?? parsed?.details ?? parsed
++    const code = Number(detail?.details?.code ?? detail?.code ?? parsed?.details?.code ?? parsed?.code)
++    const action = detail?.details?.action ?? detail?.action ?? parsed?.action
++    // 403 with code 492 is a paywall, not a lost sign-in: the account is
++    // still signed in, the model just isn't on its plan. Measured with
++    // Kimi-K3.1-Pro on a free account.
++    const paywalled = res.status === 403 && code === 492
++    const error = new TabbitError(
++      paywalled
++        ? detail?.details?.message || detail?.message || parsed?.message || "This model needs a paid Tabbit plan."
++        : `Tabbit refused the sign-in (HTTP ${res.status})${body ? `: ${body.slice(0, 200)}` : ""}`,
++      { status: res.status, code: Number.isFinite(code) ? code : undefined, action },
++    )
++    if (!paywalled) error.signIn = "expired"
++    throw error
++  }
++  if (!res.ok) {
++    let body = ""
++    try {
++      body = await res.text()
++    } catch {
++      /* nothing to add */
++    }
++    throw new TabbitError(`Tabbit answered HTTP ${res.status}${body ? `: ${body.slice(0, 300)}` : ""}`, { status: res.status })
++  }
++  return res
++}
++
++// listModels is the live catalog. It answers without a valid token too —
++// the same 22 models came back with a deliberately broken cookie — so a
++// failure here means the network or the service, never the sign-in.
++export async function listModels(creds, { scene = "chat", signal } = {}) {
++  const res = await call(creds, `/proxy/v1/model_config/models?a=0&scene=${encodeURIComponent(scene)}`, {}, signal)
++  const body = await res.json()
++  const models = Array.isArray(body?.models) ? body.models : []
++  return models.filter((m) => clean(m?.display_name))
++}
++
++// usage reads the cycle's allowance. `usage_percentage` is a string like
++// "12.18%", and the cycle is named by two dates ("2026.11.03" → "2026.11.10").
++export async function usage(creds, signal) {
++  const uid = creds.uid || ""
++  const res = await call(creds, `/api/commerce/quota/v1/usage${uid ? `?user_id=${encodeURIComponent(uid)}` : ""}`, {}, signal)
++  return await res.json()
++}
++
++// createRoom makes a conversation. Its id is also the chat_session_id, and
++// a room with no turn in it never shows up in the user's session list — the
++// list showed only rooms that had been used.
++export async function createRoom(creds, signal) {
++  const res = await call(creds, "/api/v3/chat/rooms", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }, signal)
++  const body = await res.json()
++  if (!clean(body?.room_id)) throw new TabbitError("Tabbit created no room")
++  return body.room_id
++}
++
++function escapeHTML(text) {
++  return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
++}
++
++// runTurn queues one turn. `selected_model` takes the catalog's
++// display_name, and `content` is the whole prompt: Tabbit keeps the room's
++// own history, so a follow-up may carry only the new message.
++export async function runTurn(creds, room, { content, model, parentMessageId = null, signal }) {
++  const rid = `tab_${crypto.randomUUID()}`
++  const body = {
++    client_run_id: rid,
++    client_message_id: rid,
++    agent_plan_mode_enabled: true,
++    input_payload: {
++      task_name: "chat",
++      content,
++      parent_message_id: parentMessageId,
++      selected_model: [model],
++      references: [],
++      metadatas: { html_content: `<p>${escapeHTML(content)}</p>` },
++      page_info_list: [],
++      is_mobile: false,
++      agent_mode: false,
++    },
++  }
++  const res = await call(
++    creds,
++    `/api/v3/chat/rooms/${encodeURIComponent(room)}/runs`,
++    { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) },
++    signal,
++  )
++  return await res.json()
++}
++
++// join opens the room's event stream. The server first replays a snapshot
++// of the room, so a rejoin mid-turn recovers the part of the answer that
++// was missed — the reason `last_event_id` is carried.
++export async function join(creds, room, { lastEventId = null, signal } = {}) {
++  const res = await call(
++    creds,
++    `/api/v3/chat/rooms/${encodeURIComponent(room)}/join`,
++    {
++      method: "POST",
++      headers: { "content-type": "application/json", accept: "text/event-stream" },
++      body: JSON.stringify({
++        page_instance_id: crypto.randomUUID(),
++        device_id_hash: DEVICE_HASH,
++        surface: "session",
++        last_event_id: lastEventId,
++      }),
++    },
++    signal,
++  )
++  return res
++}
++
++// ---- the daily sign-in (签到) -------------------------------------------
++//
++// The activity the desktop pet signs in to. Measured on a live account:
++//
++//   GET  /api/commerce/activity/v1/sign-in/status?scene_codes=desktop_pet
++//        {"sign_in_date":"2026-11-03","results":[{"scene_code":"desktop_pet",
++//         "activity_open":true,"signed_today":true,"signed_days":1,
++//         "total_signed_days":1,"required_days":3,"can_adopt":false,
++//         "usage_reward_result":null,"pet_entitlement_result":"not_eligible",
++//         "pet_entitlement_id":null}]}
++//
++//   POST /api/commerce/activity/v1/sign-in  {"request_no":"<uuid>","scene_codes":["desktop_pet"]}
++//        {"sign_in_date":"2026-11-03","results":[{"scene_code":"desktop_pet",
++//         "activity_open":true,"sign_in_result":"already_signed", ...}]}
++//
++// `desktop_pet` is the only scene the service takes: every other name comes
++// back SIGN_IN_SCENE_UNSUPPORTED. `request_no` is a client-made idempotency
++// key — any fresh uuid is accepted, and repeating one is not a second claim.
++
++export const SIGN_IN_SCENES = ["desktop_pet"]
++
++export async function signInStatus(creds, { scenes = SIGN_IN_SCENES, signal } = {}) {
++  const query = scenes.map((scene) => `scene_codes=${encodeURIComponent(scene)}`).join("&")
++  const res = await call(creds, `/api/commerce/activity/v1/sign-in/status?${query}`, {}, signal)
++  return await res.json()
++}
++
++export async function signIn(creds, { scenes = SIGN_IN_SCENES, requestNo = crypto.randomUUID(), signal } = {}) {
++  const res = await call(
++    creds,
++    "/api/commerce/activity/v1/sign-in",
++    { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ request_no: requestNo, scene_codes: scenes }) },
++    signal,
++  )
++  return await res.json()
++}
++
++// stop asks Tabbit to end a run, which is what a cancelled request gets.
++export async function stop(creds, room, signal) {
++  try {
++    await call(creds, "/proxy/v0/chat/stop/", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ room_id: room }) }, signal)
++  } catch {
++    /* stopping is best effort */
++  }
++}
+\ No newline at end of file
+diff --git a/packages/tabbit/src/checkin.mjs b/packages/tabbit/src/checkin.mjs
+new file mode 100644
+index 0000000..e234d92
+--- /dev/null
++++ b/packages/tabbit/src/checkin.mjs
+@@ -0,0 +1,84 @@
++// The daily sign-in (签到), as magpie's check-in hook.
++//
++// magpie calls this once a day for each signed-in account while the user has
++// the switch on (Settings → Usage → Plugins), and draws what came of it on
++// the account's card. The outcomes it knows:
++//
++//   claimed     checked in just now
++//   done        already checked in today
++//   inactive    the vendor has no check-in event now
++//   ineligible  this account can't check in at all
++//   captcha     a human has to do it (never solved here)
++//   failed      anything else; its message is shown, and magpie tries again
++//               later the same day
++//
++// Only what Tabbit actually answers is classified. A `sign_in_result` this
++// file hasn't seen is reported as a failure carrying Tabbit's own word for
++// it, rather than guessed as a success — a wrong "claimed" is worse than a
++// "failed" someone can read.
++
++import { signIn, signInStatus, SIGN_IN_SCENES } from "./api.mjs"
++
++// Tabbit's own answers, measured: a fresh claim says "signed", a second try
++// in the same day says "already_signed".
++const SIGNED = new Set(["signed", "success", "signed_in"])
++const ALREADY = new Set(["already_signed", "already", "duplicate"])
++
++// rewardOf reads a reward row without assuming its shape: a number somewhere
++// in it, or a nested amount, is what magpie's `credit` takes.
++function rewardOf(row) {
++  for (const key of ["usage_reward_result", "reward_result", "reward"]) {
++    const reward = row?.[key]
++    if (reward === null || reward === undefined) continue
++    if (typeof reward === "number") return Number.isFinite(reward) ? reward : undefined
++    for (const field of ["amount", "credit", "value", "quota", "count"]) {
++      const value = Number(reward?.[field])
++      if (Number.isFinite(value)) return value
++    }
++  }
++  return undefined
++}
++
++// saidOf is a line for the card: what the sign-in gave, in Tabbit's terms.
++function saidOf(row, status) {
++  const parts = []
++  const rewarded = rewardOf(row)
++  if (rewarded !== undefined && rewarded > 0) parts.push(`usage +${rewarded}`)
++  const days = Number(row?.signed_days ?? status?.signed_days)
++  if (Number.isFinite(days) && days > 0) {
++    const required = Number(row?.required_days ?? status?.required_days)
++    parts.push(Number.isFinite(required) && required > 0 ? `${days}/${required} days` : `${days} days`)
++  }
++  const pet = row?.pet_entitlement_result ?? status?.pet_entitlement_result
++  if (pet && pet !== "not_eligible") parts.push(`pet: ${pet}`)
++  return parts.join(" · ")
++}
++
++// checkinOf runs one day's sign-in. The status is read first: it costs
++// nothing, it says whether the activity is even open, and it is what tells
++// an already-signed day apart from a fresh claim.
++export async function checkinOf(creds, { signal } = {}) {
++  const status = await signInStatus(creds, { signal })
++  const row = (status?.results ?? [])[0]
++  if (!row) return { outcome: "ineligible", message: `Tabbit knows no sign-in for ${SIGN_IN_SCENES.join(", ")}` }
++  if (row.activity_open === false) {
++    return { outcome: "inactive", message: "Tabbit's sign-in activity is closed", ...(saidOf(row, status) ? { message: `Tabbit's sign-in activity is closed · ${saidOf(row, status)}` } : {}) }
++  }
++  if (row.signed_today === true) {
++    return { outcome: "done", streak: Number(row.signed_days) || undefined, message: saidOf(row, status) || "already signed in today" }
++  }
++
++  const result = await signIn(creds, { signal })
++  const answered = (result?.results ?? [])[0]
++  const word = String(answered?.sign_in_result ?? "").toLowerCase()
++  const reward = rewardOf(answered) ?? rewardOf(row)
++  const said = saidOf(answered ?? row, status)
++  if (SIGNED.has(word)) return { outcome: "claimed", credit: reward, streak: Number(answered?.signed_days) || undefined, message: said }
++  if (ALREADY.has(word)) return { outcome: "done", streak: Number(answered?.signed_days) || undefined, message: said || "already signed in today" }
++  if (!word && (result?.results ?? []).length === 0) {
++    return { outcome: "failed", message: "Tabbit answered the sign-in with no result" }
++  }
++  return { outcome: "failed", message: `Tabbit answered the sign-in with "${answered?.sign_in_result}"${said ? ` · ${said}` : ""}` }
++}
++
++export const _internal = { rewardOf, saidOf, SIGNED, ALREADY }
+\ No newline at end of file
+diff --git a/packages/tabbit/src/cookie.mjs b/packages/tabbit/src/cookie.mjs
+new file mode 100644
+index 0000000..e3b5ac3
+--- /dev/null
++++ b/packages/tabbit/src/cookie.mjs
+@@ -0,0 +1,156 @@
++// Reading the sign-in out of the Tabbit desktop app, without opening it.
++//
++// Tabbit Browser keeps the same Chromium cookie store every Chromium does:
++//   macOS  ~/Library/Application Support/Tabbit Browser/Default/Cookies
++//   Linux  ~/.config/Tabbit Browser/Default/Cookies (or the sibling dirs below)
++// and protects the value with the platform's own key. The database is copied
++// before it is read: a running browser holds a lock on a WAL, and reading the
++// live file gives a half-written row.
++//
++// macOS: `Tabbit Browser Safe Storage` in the login keychain holds the
++// password, and a Chromium cookie is AES-128-CBC under
++// PBKDF2-HMAC-SHA1(password, "saltysalt", 1003, 16 bytes) with a sixteen-space
++// IV, prefixed `v10`, padded PKCS#7, and (on Chromium 24 and later) a 32-byte
++// SHA-256 of the host in front of the plaintext.
++//
++// Windows does the same with DPAPI instead of a keychain; that is not
++// implemented here, and the plugin says so rather than failing obscurely.
++
++import fs from "node:fs"
++import os from "node:os"
++import path from "node:path"
++import crypto from "node:crypto"
++import { execFileSync } from "node:child_process"
++
++export const HOST = "web.tabbit.com"
++const SAFE_STORAGE = "Tabbit Browser Safe Storage"
++
++// profileDirs are the places Tabbit Browser has kept its profile, newest
++// name first. The browser's own data directory is not the same as the
++// user-data directory the old Tabbit client used, so both are listed.
++export function profileDirs(env = process.env, home = os.homedir()) {
++  const roots = [env.TABBIT_PROFILE_DIR, env.TABBIT_USER_DATA_DIR].filter(Boolean)
++  if (process.platform === "darwin") {
++    roots.push(
++      path.join(home, "Library", "Application Support", "Tabbit Browser"),
++      path.join(home, "Library", "Application Support", "Tabbit", "User Data"),
++      path.join(home, "Library", "Application Support", "Tabbit"),
++    )
++  } else if (process.platform === "win32") {
++    const local = env.LOCALAPPDATA || path.join(home, "AppData", "Local")
++    roots.push(path.join(local, "Tabbit Browser", "User Data"), path.join(local, "Tabbit", "User Data"))
++  } else {
++    const config = env.XDG_CONFIG_HOME || path.join(home, ".config")
++    roots.push(path.join(config, "Tabbit Browser"), path.join(config, "Tabbit", "User Data"))
++  }
++  return [...new Set(roots)]
++}
++
++// cookieStore finds the SQLite file, preferring a profile called Default.
++export function cookieStore(dirs = profileDirs()) {
++  for (const dir of dirs) {
++    for (const rel of [path.join("Default", "Cookies"), path.join("Network", "Cookies"), "Cookies"]) {
++      const file = path.join(dir, rel)
++      if (fs.existsSync(file)) return file
++    }
++  }
++  return null
++}
++
++// copyStore copies the database (and its WAL, when present) to a temporary
++// directory: sqlite reads the pair, and the live one is locked.
++export function copyStore(file, tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tabbit-cookies-"))) {
++  const copy = path.join(tmp, "Cookies")
++  fs.copyFileSync(file, copy)
++  for (const suffix of ["-wal", "-shm"]) {
++    if (fs.existsSync(file + suffix)) fs.copyFileSync(file + suffix, copy + suffix)
++  }
++  return copy
++}
++
++// keychainPassword asks the login keychain for the browser's storage
++// password. A keychain that is locked, or a prompt the user dismisses,
++// makes this throw and the caller falls back to a pasted value.
++export function keychainPassword(service = SAFE_STORAGE) {
++  const out = execFileSync("security", ["find-generic-password", "-s", service, "-w"], {
++    encoding: "utf8",
++    stdio: ["ignore", "pipe", "ignore"],
++    timeout: 15_000,
++  })
++  const password = String(out).replace(/\r?\n$/, "")
++  if (!password) throw new Error(`the keychain holds no password under "${service}"`)
++  return password
++}
++
++// decryptValue turns one `encrypted_value` blob into text.
++export function decryptValue(blob, { password, host = HOST } = {}) {
++  const buf = Buffer.isBuffer(blob) ? blob : Buffer.from(blob)
++  const prefix = buf.subarray(0, 3).toString("latin1")
++  if (prefix !== "v10" && prefix !== "v11") throw new Error(`unsupported cookie encryption (${prefix})`)
++  const key =
++    process.platform === "linux" && !password
++      ? crypto.pbkdf2Sync("peanuts", "saltysalt", 1, 16, "sha1")
++      : crypto.pbkdf2Sync(password, "saltysalt", 1003, 16, "sha1")
++  const decipher = crypto.createDecipheriv("aes-128-cbc", key, Buffer.alloc(16, 0x20))
++  decipher.setAutoPadding(false)
++  let plain = Buffer.concat([decipher.update(buf.subarray(3)), decipher.final()])
++  const pad = plain[plain.length - 1]
++  // PKCS#7 only ever strips 1..16 bytes; anything else means the key was wrong
++  // and stripping would quietly corrupt the value.
++  if (pad > 0 && pad <= 16 && pad <= plain.length) plain = plain.subarray(0, plain.length - pad)
++  const hostHash = crypto.createHash("sha256").update(host).digest()
++  if (plain.length > 32 && plain.subarray(0, 32).equals(hostHash)) plain = plain.subarray(32)
++  return plain.toString("utf8")
++}
++
++// readCookies reads the wanted names for one host out of the copied store.
++// node:sqlite is in Node 22 and later, which is what magpie's host and the
++// plugin's own engines field ask for.
++export function readCookies(store, { host = HOST, names = ["token", "user_id"] } = {}) {
++  const { DatabaseSync } = require_node_sqlite()
++  const db = new DatabaseSync(store, { readOnly: true })
++  try {
++    const rows = db
++      .prepare("select name, value, encrypted_value from cookies where host_key = ? and name in (?, ?)")
++      .all(host, names[0], names[1])
++    return rows.map((row) => ({ name: row.name, value: row.value, encrypted: row.encrypted_value }))
++  } finally {
++    db.close()
++  }
++}
++
++function require_node_sqlite() {
++  // A static import of a built-in that older Node lacks would fail the whole
++  // module; resolving it here lets the plugin load and say what is missing.
++  const sqlite = globalThis.process?.getBuiltinModule?.("node:sqlite")
++  if (!sqlite?.DatabaseSync) throw new Error("reading Tabbit's cookies needs Node 22 or later (node:sqlite)")
++  return sqlite
++}
++
++// desktopSignIn returns the cookie header and what it belongs to, or throws
++// with the reason a caller can show.
++export function desktopSignIn({ dirs = profileDirs(), host = HOST, store, password } = {}) {
++  if (process.platform === "win32") throw new Error("reading Tabbit's cookies on Windows needs DPAPI, which this plugin doesn't do yet; paste the token instead")
++  const file = store || cookieStore(dirs)
++  if (!file) throw new Error(`no Tabbit Browser cookie store found; looked in ${dirs.join(", ")}`)
++  const copy = copyStore(file)
++  const rows = readCookies(copy, { host })
++  const token = rows.find((r) => r.name === "token")
++  if (!token) throw new Error(`Tabbit Browser is not signed in to ${host}`)
++  const secret = password ?? keychainPassword()
++  const value = token.value?.startsWith("ey") ? token.value : decryptValue(token.encrypted, { password: secret, host })
++  const uid = rows.find((r) => r.name === "user_id")
++  const uidValue = uid?.value || (uid?.encrypted ? safeDecrypt(uid.encrypted, secret, host) : "")
++  const header = [`token=${value}`, uidValue && `user_id=${uidValue}`, uidValue && `SAPISID=${uidValue}`, "managed=tab_browser"].filter(Boolean).join("; ")
++  return { key: header, userId: uidValue, store: file }
++}
++
++function safeDecrypt(blob, password, host) {
++  try {
++    return decryptValue(blob, { password, host })
++  } catch {
++    return ""
++  }
++}
++
++export const _internal = { safeDecrypt, SAFE_STORAGE }
+\ No newline at end of file
+diff --git a/packages/tabbit/src/models.mjs b/packages/tabbit/src/models.mjs
+new file mode 100644
+index 0000000..24a8115
+--- /dev/null
++++ b/packages/tabbit/src/models.mjs
+@@ -0,0 +1,116 @@
++// Turning Tabbit's catalog into the models magpie shows.
++//
++// The catalog is the one `web.tabbit.com/proxy/v1/model_config/models` gives
++// the app. Its fields that decide what an agent may do:
++//
++//   display_name       the id a turn is asked with (selected_model), so it is
++//                      also this provider's model id — nothing is invented
++//   supports_images    the model can read an image
++//   supports_tools     the model has Tabbit's *server* tools (browser, search)
++//                      — not client tools, so `toolcall` stays false
++//   support_thinking   the model reasons, and the stream carries the thinking
++//   model_access_type  free_unlimited (Default), free_metered, premium_only
++//   display_multiplier Tabbit's credit multiplier, not a USD price
++//   hidden             the app hides it; so do we
++//
++// Limits are not in the catalog. Tabbit publishes none, so the defaults below
++// apply and are overridable per model: a context the vendor does not state is
++// better shown as a known default than guessed from a description.
++
++import { BASE } from "./api.mjs"
++
++export const NPM = "@ai-sdk/openai-compatible"
++export const CHAT_BASE = `${BASE}/api/v3/chat`
++
++export const DEFAULT_CONTEXT = Number(process.env.TABBIT_CONTEXT || 131072)
++export const DEFAULT_OUTPUT = Number(process.env.TABBIT_OUTPUT || 32768)
++
++// The two limits Tabbit implies in a model's own description. Everything
++// else keeps the default; an agent that is sent past a real limit gets
++// Tabbit's own error, which magpie reads as a context overflow.
++const LIMITS = {
++  "DeepSeek-V4.1-Flash": { context: 1048576, output: 32768 },
++  "DeepSeek-V4-Pro": { context: 1048576, output: 32768 },
++}
++
++// A bootstrap list, so the Providers page has something before a sign-in and
++// the check script sees a non-empty config. The live catalog replaces it.
++export const BOOTSTRAP = [
++  { display_name: "Default", supports_images: false, supports_tools: true, support_thinking: true, model_access_type: "free_unlimited", display_multiplier: 0 },
++  { display_name: "DeepSeek-V4.1-Flash", supports_images: true, supports_tools: true, support_thinking: true, model_access_type: "free_metered", display_multiplier: 0.2 },
++  { display_name: "GLM-5.3-Flash", supports_images: true, supports_tools: true, support_thinking: true, model_access_type: "free_metered", display_multiplier: 0.1 },
++  { display_name: "GLM-5.3", supports_images: false, supports_tools: true, support_thinking: true, model_access_type: "free_metered", display_multiplier: 0.6 },
++  { display_name: "Qwen3.8-Max", supports_images: false, supports_tools: true, support_thinking: true, model_access_type: "free_metered", display_multiplier: 0.9 },
++]
++
++const clean = (v) => (typeof v === "string" ? v.trim() : "")
++
++export function isFree(model) {
++  return clean(model?.model_access_type).startsWith("free")
++}
++
++export function isPremium(model) {
++  return clean(model?.model_access_type) === "premium_only"
++}
++
++// modelIdOf is the catalog's display name, verbatim: a turn asked with
++// anything else is refused or answered by a different model.
++export function modelIdOf(model) {
++  return clean(model?.display_name)
++}
++
++// rowOf is the descriptor both magpie readers take: the config hook reads
++// the top-level fields, the models hook reads `capabilities`.
++export function rowOf(model, { context = DEFAULT_CONTEXT, output = DEFAULT_OUTPUT } = {}) {
++  const id = modelIdOf(model)
++  if (!id) return null
++  const limit = LIMITS[id] ?? { context, output }
++  const image = Boolean(model?.supports_images)
++  const reasoning = Boolean(model?.support_thinking)
++  return {
++    id,
++    providerID: "tabbit",
++    name: id,
++    api: { id, url: CHAT_BASE, npm: NPM },
++    limit,
++    // Tabbit's models all stream and reason; tool calls are Tabbit's own
++    // server tools, so a client tool an agent declares cannot be honoured.
++    reasoning,
++    tool_call: false,
++    modalities: { input: image ? ["text", "image"] : ["text"], output: ["text"] },
++    capabilities: {
++      temperature: true,
++      reasoning,
++      toolcall: false,
++      attachment: false,
++      input: { text: true, image, audio: false, video: false, pdf: false },
++      output: { text: true, image: false, audio: false, video: false, pdf: false },
++    },
++    options: {},
++    headers: {},
++    variants: {},
++    status: "active",
++    release_date: "",
++  }
++}
++
++// rowsOf turns a catalog into { id: row }, the shape config and the models
++// hook both return. Hidden rows are dropped, and so are premium-only rows
++// when the caller asks for the free ones.
++export function rowsOf(models, { freeOnly = false, context, output } = {}) {
++  const out = {}
++  for (const model of Array.isArray(models) ? models : []) {
++    if (model?.hidden) continue
++    if (freeOnly && !isFree(model)) continue
++    const row = rowOf(model, { context, output })
++    if (row) out[row.id] = row
++  }
++  return out
++}
++
++// namesOf is only what a turn needs: the display names, in catalog order.
++export function namesOf(models) {
++  return (Array.isArray(models) ? models : []).map(modelIdOf).filter(Boolean)
++}
++
++export const _internal = { LIMITS }
+\ No newline at end of file
+diff --git a/packages/tabbit/src/sse.mjs b/packages/tabbit/src/sse.mjs
+new file mode 100644
+index 0000000..194dea5
+--- /dev/null
++++ b/packages/tabbit/src/sse.mjs
+@@ -0,0 +1,192 @@
++// Tabbit's turn stream, read as the events the web app reads.
++//
++// The wire is `text/event-stream` with `event:`/`data:`/`id:` lines and a
++// blank line between events. The names measured on a real turn, in order:
++//
++//   snapshot_begin, message_history, active_runs_snapshot, snapshot_end
++//   user_message_created
++//   assistant_message_started
++//   event_message_chunk      chunk_type=thinking        → chunk_payload.reasoning_content
++//   event_message_chunk      chunk_type=thinking_finished
++//   assistant_message_delta  chunk_type=message_chunk   → chunk_payload.content
++//   session_title_updated
++//   assistant_message_finished
++//   run_completed
++//   room_reset_required
++//
++// `run_failed` replaces the last three when the turn does not finish.
++
++import { STREAM_TIMEOUT } from "./api.mjs"
++
++// parseSSE turns a byte stream into {event, data, id} records. It is a plain
++// reader, not an EventSource: no reconnect, no last-event-id store — the
++// caller decides whether to rejoin.
++export async function* parseSSE(body, { signal } = {}) {
++  const reader = body.getReader()
++  const decoder = new TextDecoder()
++  let buffer = ""
++  let event = ""
++  let id = null
++  let data = []
++  const flush = function* () {
++    if (data.length || event) yield { event: event || "message", data: data.join("\n"), id }
++    event = ""
++    id = null
++    data = []
++  }
++  try {
++    for (;;) {
++      if (signal?.aborted) throw signal.reason ?? new Error("aborted")
++      const { value, done } = await reader.read()
++      if (done) break
++      buffer += decoder.decode(value, { stream: true })
++      for (;;) {
++        const at = buffer.indexOf("\n")
++        if (at < 0) break
++        const line = buffer.slice(0, at).replace(/\r$/, "")
++        buffer = buffer.slice(at + 1)
++        if (line === "") {
++          yield* flush()
++          continue
++        }
++        if (line.startsWith(":")) continue
++        const colon = line.indexOf(":")
++        const field = colon < 0 ? line : line.slice(0, colon)
++        const raw = colon < 0 ? "" : line.slice(colon + 1).replace(/^ /, "")
++        if (field === "event") event = raw
++        else if (field === "data") data.push(raw)
++        else if (field === "id") id = raw
++      }
++    }
++    yield* flush()
++  } finally {
++    try {
++      await reader.cancel()
++    } catch {
++      /* the stream is over either way */
++    }
++  }
++}
++
++function safeJSON(text) {
++  try {
++    return JSON.parse(text)
++  } catch {
++    return null
++  }
++}
++
++// turnDeltas is one turn, as it arrives: the text and thinking chunks in
++// order, then what the conversation needs to hang the next turn off.
++//
++// A stream that stops without `run_completed` is reported as truncated: an
++// answer cut in half that looks whole is the failure worth naming.
++export async function* turnDeltas(response, { signal, timeoutMs = STREAM_TIMEOUT } = {}) {
++  const reason = new AbortController()
++  const timer = setTimeout(() => reason.abort(new Error("Tabbit's turn timed out")), timeoutMs)
++  const onAbort = () => reason.abort(signal?.reason)
++  if (signal) {
++    if (signal.aborted) onAbort()
++    else signal.addEventListener("abort", onAbort, { once: true })
++  }
++  let history = []
++  const state = {
++    text: "",
++    reasoning: "",
++    userMessageId: null,
++    assistantMessageId: null,
++    runId: null,
++    model: null,
++    title: null,
++    completed: false,
++    failed: null,
++    truncated: false,
++    lastEventId: null,
++  }
++  try {
++    for await (const frame of parseSSE(response.body, { signal: reason.signal })) {
++      if (frame.id) state.lastEventId = frame.id
++      const payload = safeJSON(frame.data)
++      switch (frame.event) {
++        case "message_history": {
++          // Held until active_runs_snapshot says which message this turn is
++          // answering: the snapshot lists the room's whole history, and the
++          // old answers in it are not this turn's text.
++          history = payload?.payload?.messages ?? []
++          break
++        }
++        case "active_runs_snapshot": {
++          const run = payload?.payload?.runs?.[0]
++          if (run) {
++            state.runId = run.run_id ?? state.runId
++            state.assistantMessageId = run.assistant_message_id ?? state.assistantMessageId
++            const mine = history.find((m) => m?.message_id && m.message_id === run.assistant_message_id)
++            // A rejoin mid-turn is the only case with text already written.
++            if (mine && typeof mine.content === "string" && mine.content) {
++              state.text = mine.content
++              yield { type: "text", value: mine.content, replay: true }
++            }
++            if (mine && typeof mine.reasoning_content === "string" && mine.reasoning_content) state.reasoning = mine.reasoning_content
++          }
++          break
++        }
++        case "user_message_created":
++          state.userMessageId = payload?.payload?.message_id ?? payload?.payload?.chunk_payload?.message_id ?? state.userMessageId
++          break
++        case "assistant_message_started":
++          state.runId = payload?.payload?.run_id ?? state.runId
++          state.assistantMessageId = payload?.payload?.message_id ?? payload?.payload?.chunk_payload?.message_id ?? state.assistantMessageId
++          yield { type: "started", messageId: state.assistantMessageId, runId: state.runId }
++          break
++        case "event_message_chunk":
++          if (payload?.payload?.chunk_type === "thinking") {
++            const value = payload?.payload?.chunk_payload?.reasoning_content ?? ""
++            if (value) {
++              state.reasoning += value
++              yield { type: "thinking", value }
++            }
++          }
++          break
++        case "assistant_message_delta": {
++          const value = payload?.payload?.chunk_payload?.content ?? ""
++          if (value) {
++            state.text += value
++            yield { type: "text", value }
++          }
++          break
++        }
++        case "session_title_updated":
++          state.title = payload?.payload?.title ?? payload?.payload?.chunk_payload?.title ?? state.title
++          break
++        case "assistant_message_finished":
++          state.assistantMessageId = payload?.payload?.message_id ?? state.assistantMessageId
++          state.model = payload?.payload?.model_name ?? state.model
++          break
++        case "run_completed":
++          state.completed = true
++          break
++        case "run_failed":
++          state.failed = payload?.payload ?? { status: "FAILED" }
++          break
++        default:
++          break
++      }
++    }
++  } finally {
++    clearTimeout(timer)
++    signal?.removeEventListener?.("abort", onAbort)
++  }
++  if (!state.completed && !state.failed) state.truncated = state.text.length > 0
++  yield { type: "end", state }
++}
++
++// readTurn drains turnDeltas into the finished turn, for a caller that wants
++// the whole answer rather than its pieces.
++export async function readTurn(response, options = {}) {
++  for await (const part of turnDeltas(response, options)) {
++    if (part.type === "end") return part.state
++  }
++  return null
++}
++
++export const _internal = { safeJSON }
+\ No newline at end of file
+diff --git a/packages/tabbit/tests/checkin.test.mjs b/packages/tabbit/tests/checkin.test.mjs
+new file mode 100644
+index 0000000..967ec94
+--- /dev/null
++++ b/packages/tabbit/tests/checkin.test.mjs
+@@ -0,0 +1,126 @@
++// The daily sign-in: what Tabbit's own answers come to.
++
++import test from "node:test"
++import assert from "node:assert/strict"
++import { checkinOf, _internal } from "../src/checkin.mjs"
++
++const creds = { header: "token=t; user_id=u", token: "t", uid: "u" }
++
++// stub answers the status and the sign-in with what the test wants.
++function stub({ status, claim } = {}) {
++  const calls = []
++  const original = globalThis.fetch
++  globalThis.fetch = async (input, init = {}) => {
++    const url = new URL(typeof input === "string" ? input : input.url)
++    calls.push({ path: url.pathname, query: url.search, method: init.method ?? "GET", body: init.body })
++    if (url.pathname.endsWith("/sign-in/status")) return Response.json(status ?? {})
++    if (url.pathname.endsWith("/sign-in")) return Response.json(claim ?? {})
++    return new Response("nope", { status: 404 })
++  }
++  return { calls, restore: () => (globalThis.fetch = original) }
++}
++
++const open = (extra) => ({
++  sign_in_date: "2026-11-03",
++  results: [{ scene_code: "desktop_pet", activity_open: true, signed_today: false, signed_days: 0, total_signed_days: 0, required_days: 3, usage_reward_result: null, pet_entitlement_result: "not_eligible", ...extra }],
++})
++
++test("a day already signed is 'done', and nothing is claimed", async () => {
++  const { calls, restore } = stub({ status: open({ signed_today: true, signed_days: 1 }) })
++  try {
++    const out = await checkinOf(creds)
++    assert.equal(out.outcome, "done")
++    assert.equal(out.streak, 1)
++    assert.equal(calls.filter((c) => c.method === "POST").length, 0)
++  } finally {
++    restore()
++  }
++})
++
++test("a fresh day is claimed, with the request number Tabbit wants", async () => {
++  const { calls, restore } = stub({
++    status: open(),
++    claim: { sign_in_date: "2026-11-03", results: [{ scene_code: "desktop_pet", activity_open: true, sign_in_result: "signed", signed_days: 1, required_days: 3, usage_reward_result: { amount: 5 } }] },
++  })
++  try {
++    const out = await checkinOf(creds)
++    assert.equal(out.outcome, "claimed")
++    assert.equal(out.credit, 5)
++    assert.equal(out.streak, 1)
++    const post = calls.find((c) => c.method === "POST")
++    const body = JSON.parse(post.body)
++    assert.deepEqual(body.scene_codes, ["desktop_pet"])
++    assert.match(body.request_no, /^[0-9a-f-]{36}$/)
++  } finally {
++    restore()
++  }
++})
++
++test("a race that lands on 'already_signed' is 'done', not a failure", async () => {
++  const { restore } = stub({
++    status: open(),
++    claim: { results: [{ scene_code: "desktop_pet", activity_open: true, sign_in_result: "already_signed", signed_days: 1 }] },
++  })
++  try {
++    assert.equal((await checkinOf(creds)).outcome, "done")
++  } finally {
++    restore()
++  }
++})
++
++test("a closed activity is 'inactive'", async () => {
++  const { restore } = stub({ status: { results: [{ scene_code: "desktop_pet", activity_open: false, signed_today: false }] } })
++  try {
++    assert.equal((await checkinOf(creds)).outcome, "inactive")
++  } finally {
++    restore()
++  }
++})
++
++test("no result for the scene is 'ineligible'", async () => {
++  const { restore } = stub({ status: { sign_in_date: "2026-11-03", results: [] } })
++  try {
++    assert.equal((await checkinOf(creds)).outcome, "ineligible")
++  } finally {
++    restore()
++  }
++})
++
++test("a word this file hasn't seen is reported, not guessed as a success", async () => {
++  const { restore } = stub({ status: open(), claim: { results: [{ scene_code: "desktop_pet", sign_in_result: "throttled" }] } })
++  try {
++    const out = await checkinOf(creds)
++    assert.equal(out.outcome, "failed")
++    assert.match(out.message, /throttled/)
++  } finally {
++    restore()
++  }
++})
++
++test("a refused sign-in throws with magpie's expired mark", async () => {
++  const original = globalThis.fetch
++  globalThis.fetch = async () => new Response(JSON.stringify({ detail: "invalid bearer token" }), { status: 401 })
++  try {
++    await assert.rejects(() => checkinOf(creds), (error) => error.signIn === "expired")
++  } finally {
++    globalThis.fetch = original
++  }
++})
++
++test("the status call asks for the scene the service takes", async () => {
++  const { calls, restore } = stub({ status: open({ signed_today: true }) })
++  try {
++    await checkinOf(creds)
++    assert.match(calls[0].query, /scene_codes=desktop_pet/)
++  } finally {
++    restore()
++  }
++})
++
++test("a reward's number is read out of whatever shape it arrives in", () => {
++  assert.equal(_internal.rewardOf({ usage_reward_result: { amount: 3 } }), 3)
++  assert.equal(_internal.rewardOf({ usage_reward_result: { credit: "7" } }), 7)
++  assert.equal(_internal.rewardOf({ usage_reward_result: 12 }), 12)
++  assert.equal(_internal.rewardOf({ usage_reward_result: null }), undefined)
++  assert.equal(_internal.rewardOf({}), undefined)
++})
+diff --git a/packages/tabbit/tests/cookie.test.mjs b/packages/tabbit/tests/cookie.test.mjs
+new file mode 100644
+index 0000000..0556947
+--- /dev/null
++++ b/packages/tabbit/tests/cookie.test.mjs
+@@ -0,0 +1,88 @@
++// The cookie store: a synthetic Chromium v10 blob, decrypted with a known
++// password, and the store lookup that finds the file.
++
++import test from "node:test"
++import assert from "node:assert/strict"
++import crypto from "node:crypto"
++import fs from "node:fs"
++import os from "node:os"
++import path from "node:path"
++import { decryptValue, cookieStore, copyStore, profileDirs, readCookies } from "../src/cookie.mjs"
++
++const HOST = "web.tabbit.com"
++const PASSWORD = "test-password"
++
++// seal makes the blob Chromium's own macOS encryption makes: AES-128-CBC
++// under the keychain password, `v10`, a 32-byte SHA-256 of the host in
++// front of the plaintext, and PKCS#7 padding.
++function seal(plaintext, { password = PASSWORD, host = HOST } = {}) {
++  const key = crypto.pbkdf2Sync(password, "saltysalt", 1003, 16, "sha1")
++  const body = Buffer.concat([crypto.createHash("sha256").update(host).digest(), Buffer.from(plaintext, "utf8")])
++  const pad = 16 - (body.length % 16)
++  const padded = Buffer.concat([body, Buffer.alloc(pad, pad)])
++  const cipher = crypto.createCipheriv("aes-128-cbc", key, Buffer.alloc(16, 0x20))
++  cipher.setAutoPadding(false)
++  return Buffer.concat([Buffer.from("v10", "latin1"), cipher.update(padded), cipher.final()])
++}
++
++test("a v10 blob decrypts to the plaintext", () => {
++  const token = "eyJhbGciOiJSUzI1NiJ9.payload.sig"
++  assert.equal(decryptValue(seal(token), { password: PASSWORD }), token)
++})
++
++test("the wrong password does not yield a plausible value", () => {
++  let value = null
++  try {
++    value = decryptValue(seal("hello"), { password: "wrong" })
++  } catch {
++    /* a wrong key usually throws on the padding */
++  }
++  assert.notEqual(value, "hello")
++})
++
++test("a blob that isn't v10 is refused", () => {
++  assert.throws(() => decryptValue(Buffer.from("v20xxxx"), { password: PASSWORD }), /unsupported cookie encryption/)
++})
++
++test("profileDirs honours an explicit override first", () => {
++  const dirs = profileDirs({ TABBIT_PROFILE_DIR: "/tmp/one" }, "/home/u")
++  assert.equal(dirs[0], "/tmp/one")
++})
++
++test("cookieStore finds Default/Cookies under a profile root", () => {
++  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tabbit-test-"))
++  fs.mkdirSync(path.join(root, "Default"), { recursive: true })
++  fs.writeFileSync(path.join(root, "Default", "Cookies"), "")
++  assert.equal(cookieStore([root]), path.join(root, "Default", "Cookies"))
++  assert.equal(cookieStore([path.join(root, "missing")]), null)
++})
++
++test("copyStore copies the database and its WAL", () => {
++  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tabbit-test-"))
++  const file = path.join(root, "Cookies")
++  fs.writeFileSync(file, "db")
++  fs.writeFileSync(file + "-wal", "wal")
++  const copy = copyStore(file, fs.mkdtempSync(path.join(os.tmpdir(), "tabbit-copy-")))
++  assert.equal(fs.readFileSync(copy, "utf8"), "db")
++  assert.equal(fs.readFileSync(copy + "-wal", "utf8"), "wal")
++})
++
++test("readCookies reads token and user_id back out of a real sqlite file", () => {
++  let DatabaseSync
++  try {
++    DatabaseSync = globalThis.process.getBuiltinModule("node:sqlite").DatabaseSync
++  } catch {
++    return // older Node: the plugin says so at runtime too
++  }
++  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tabbit-test-"))
++  const file = path.join(root, "Cookies")
++  const db = new DatabaseSync(file)
++  db.exec("create table cookies(host_key text, name text, value text, encrypted_value blob)")
++  db.prepare("insert into cookies values (?,?,?,?)").run(HOST, "token", "", seal("tok-123"))
++  db.prepare("insert into cookies values (?,?,?,?)").run(HOST, "user_id", "u-1", Buffer.alloc(0))
++  db.close()
++  const rows = readCookies(file)
++  const token = rows.find((r) => r.name === "token")
++  assert.equal(decryptValue(token.encrypted, { password: PASSWORD }), "tok-123")
++  assert.equal(rows.find((r) => r.name === "user_id").value, "u-1")
++})
+diff --git a/packages/tabbit/tests/models.test.mjs b/packages/tabbit/tests/models.test.mjs
+new file mode 100644
+index 0000000..3784ab4
+--- /dev/null
++++ b/packages/tabbit/tests/models.test.mjs
+@@ -0,0 +1,64 @@
++// The catalog → magpie model rows.
++
++import test from "node:test"
++import assert from "node:assert/strict"
++import { BOOTSTRAP, rowsOf, rowOf, modelIdOf, isFree, isPremium, namesOf } from "../src/models.mjs"
++
++const catalog = [
++  { display_name: "Default", supports_tools: true, support_thinking: true, model_access_type: "free_unlimited", display_multiplier: 0 },
++  { display_name: "DeepSeek-V4.1-Flash", supports_images: true, supports_tools: true, support_thinking: true, model_access_type: "free_metered", display_multiplier: 0.2 },
++  { display_name: "Kimi-K3.1-Pro", supports_images: true, supports_tools: true, support_thinking: true, model_access_type: "premium_only", display_multiplier: 1 },
++  { display_name: "Hidden-Thing", hidden: true, model_access_type: "free_metered" },
++]
++
++test("the model id is the catalog's display name, verbatim", () => {
++  assert.equal(modelIdOf(catalog[1]), "DeepSeek-V4.1-Flash")
++  assert.deepEqual(namesOf(catalog), ["Default", "DeepSeek-V4.1-Flash", "Kimi-K3.1-Pro", "Hidden-Thing"])
++})
++
++test("free / premium come from model_access_type", () => {
++  assert.equal(isFree(catalog[0]), true)
++  assert.equal(isFree(catalog[1]), true)
++  assert.equal(isFree(catalog[2]), false)
++  assert.equal(isPremium(catalog[2]), true)
++})
++
++test("rowsOf drops hidden models, and premium ones when asked", () => {
++  assert.deepEqual(Object.keys(rowsOf(catalog)), ["Default", "DeepSeek-V4.1-Flash", "Kimi-K3.1-Pro"])
++  assert.deepEqual(Object.keys(rowsOf(catalog, { freeOnly: true })), ["Default", "DeepSeek-V4.1-Flash"])
++})
++
++test("a row says what an agent may do: reason yes, client tools no", () => {
++  const row = rowOf(catalog[1])
++  assert.equal(row.id, "DeepSeek-V4.1-Flash")
++  assert.equal(row.providerID, "tabbit")
++  assert.equal(row.api.npm, "@ai-sdk/openai-compatible")
++  assert.equal(row.capabilities.reasoning, true)
++  // Tabbit's tools are server-side; a client-declared tool cannot be honoured.
++  assert.equal(row.capabilities.toolcall, false)
++  assert.equal(row.capabilities.input.image, true)
++  assert.equal(catalog[2].supports_images, true)
++})
++
++test("a text-only model does not claim image input", () => {
++  const row = rowOf(catalog[0])
++  assert.equal(row.capabilities.input.image, false)
++})
++
++test("known limits win over the default, and the default is used otherwise", () => {
++  const deep = rowOf(catalog[1])
++  assert.equal(deep.limit.context, 1048576)
++  const other = rowOf({ display_name: "Whatever" }, { context: 12345, output: 678 })
++  assert.deepEqual(other.limit, { context: 12345, output: 678 })
++})
++
++test("the bootstrap catalog is non-empty and every row is well formed", () => {
++  assert.ok(BOOTSTRAP.length >= 3)
++  const rows = rowsOf(BOOTSTRAP)
++  assert.ok(Object.keys(rows).length >= 3)
++  for (const row of Object.values(rows)) {
++    assert.equal(row.providerID, "tabbit")
++    assert.ok(row.id && row.name)
++    assert.ok(row.limit.context > 0)
++  }
++})
+diff --git a/packages/tabbit/tests/plugin.test.mjs b/packages/tabbit/tests/plugin.test.mjs
+new file mode 100644
+index 0000000..b863fd7
+--- /dev/null
++++ b/packages/tabbit/tests/plugin.test.mjs
+@@ -0,0 +1,314 @@
++// The plugin's own hooks: the config shape magpie reads, the room plan, and
++// a whole request answered from a stubbed Tabbit.
++
++import test from "node:test"
++import assert from "node:assert/strict"
++import { TabbitPlugin, _internal } from "../index.mjs"
++import { credsOf, claimsOf, uidOfClaims, stale, expiresAt } from "../src/api.mjs"
++
++const frame = (event, data) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
++
++const GOOD_TURN = [
++  frame("message_history", { payload: { messages: [{ message_id: "a0", role: "user", content: "hi" }, { message_id: "a1", role: "assistant", content: "" }] } }),
++  frame("assistant_message_started", { payload: { run_id: "r1", message_id: "a1" } }),
++  frame("event_message_chunk", { payload: { chunk_type: "thinking", chunk_payload: { reasoning_content: "想" } } }),
++  frame("assistant_message_delta", { payload: { chunk_payload: { content: "你" } } }),
++  frame("assistant_message_delta", { payload: { chunk_payload: { content: "好" } } }),
++  frame("assistant_message_finished", { payload: { message_id: "a1" } }),
++  frame("run_completed", { payload: { status: "COMPLETED" } }),
++].join("")
++
++// installFetch stubs the network with a Tabbit that answers the four calls.
++function installFetch({ onCall } = {}) {
++  const calls = []
++  const original = globalThis.fetch
++  globalThis.fetch = async (input, init = {}) => {
++    const url = new URL(typeof input === "string" ? input : input.url)
++    const method = (init.method ?? "GET").toUpperCase()
++    calls.push({ method, path: url.pathname, headers: new Headers(init.headers ?? {}), body: init.body })
++    onCall?.({ method, path: url.pathname, init })
++    if (url.pathname === "/api/v3/chat/rooms" && method === "POST") {
++      return Response.json({ room_id: "room-" + calls.length, chat_session_id: "room-" + calls.length })
++    }
++    if (url.pathname.endsWith("/runs") && method === "POST") {
++      return Response.json({ run_id: "run-1", status: "QUEUED" })
++    }
++    if (url.pathname.endsWith("/join") && method === "POST") {
++      const encoder = new TextEncoder()
++      return new Response(
++        new ReadableStream({
++          start(c) {
++            c.enqueue(encoder.encode(GOOD_TURN))
++            c.close()
++          },
++        }),
++        { status: 200, headers: { "content-type": "text/event-stream" } },
++      )
++    }
++    if (url.pathname === "/proxy/v1/model_config/models") {
++      return Response.json({
++        models: [
++          { display_name: "Default", supports_tools: true, support_thinking: true, model_access_type: "free_unlimited" },
++          { display_name: "Kimi-K3.1-Pro", supports_tools: true, support_thinking: true, model_access_type: "premium_only" },
++          { display_name: "GLM-5.3-Flash", supports_images: true, supports_tools: true, support_thinking: true, model_access_type: "free_metered" },
++        ],
++      })
++    }
++    if (url.pathname === "/api/commerce/quota/v1/usage") {
++      return Response.json({ member_level: "free", usage_percentage: "12.18%", current_cycle_start: "2026.11.03", current_cycle_end: "2026.11.10" })
++    }
++    return new Response("not found", { status: 404 })
++  }
++  return { calls, restore: () => (globalThis.fetch = original) }
++}
++
++const auth = { type: "api", key: "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1LTEifQ.sig", metadata: { userId: "u-1" } }
++
++test("config declares tabbit as an OpenAI-compatible provider with bootstrap models", async () => {
++  const hooks = await TabbitPlugin()
++  const cfg = { provider: {} }
++  await hooks.config(cfg)
++  const p = cfg.provider.tabbit
++  assert.equal(p.name, "Tabbit")
++  assert.equal(p.npm, "@ai-sdk/openai-compatible")
++  assert.ok(p.api.endsWith("/api/v3/chat"))
++  assert.ok(Object.keys(p.models).length >= 3)
++})
++
++test("planTurn continues a room only when the transcript does", () => {
++  const first = _internal.planTurn(undefined, [{ role: "user", content: "我叫小明" }], 1000)
++  assert.equal(first.room, null)
++  assert.match(first.content, /我叫小明/)
++
++  const entry = { room: "room-1", parent: "a1", sent: [{ role: "user", content: "我叫小明" }, { role: "assistant", content: "记住了" }], at: 1000 }
++  const next = _internal.planTurn(entry, [
++    { role: "user", content: "我叫小明" },
++    { role: "assistant", content: "记住了" },
++    { role: "user", content: "我叫什么" },
++  ], 2000)
++  assert.equal(next.room, "room-1")
++  assert.equal(next.parent, "a1")
++  assert.equal(next.content, "我叫什么")
++})
++
++test("a diverging transcript gets a fresh room and a flattened prompt", () => {
++  const entry = { room: "room-1", parent: "a1", sent: [{ role: "user", content: "别的" }], at: 1000 }
++  const plan = _internal.planTurn(entry, [{ role: "user", content: "全新的话题" }], 2000)
++  assert.equal(plan.room, null)
++  assert.match(plan.content, /全新的话题/)
++})
++
++test("a stale room is not continued", () => {
++  const entry = { room: "room-1", parent: "a1", sent: [{ role: "user", content: "a" }], at: 0 }
++  const plan = _internal.planTurn(entry, [{ role: "user", content: "a" }, { role: "assistant", content: "b" }, { role: "user", content: "c" }], 31 * 60 * 1000)
++  assert.equal(plan.room, null)
++})
++
++test("a non-streaming request is answered as one chat.completion", async () => {
++  const { calls, restore } = installFetch()
++  try {
++    const hooks = await TabbitPlugin()
++    const loader = await hooks.auth.loader(async () => auth)
++    const res = await loader.fetch(`${loader.baseURL}/chat/completions`, {
++      method: "POST",
++      headers: { "content-type": "application/json", "x-magpie-tabbit-session": "s1" },
++      body: JSON.stringify({ model: "Default", messages: [{ role: "user", content: "hi" }], stream: false }),
++    })
++    const body = await res.json()
++    assert.equal(res.status, 200)
++    assert.equal(body.object, "chat.completion")
++    assert.equal(body.choices[0].message.content, "你好")
++    assert.equal(body.choices[0].message.reasoning_content, "想")
++    assert.ok(body.usage.total_tokens > 0)
++    // the cookie the token implies is on every call
++    assert.match(calls[0].headers.get("cookie"), /token=eyJ/)
++  } finally {
++    restore()
++  }
++})
++
++test("a streaming request comes back as OpenAI chunks ending in [DONE]", async () => {
++  const { restore } = installFetch()
++  try {
++    const hooks = await TabbitPlugin()
++    const loader = await hooks.auth.loader(async () => auth)
++    const res = await loader.fetch(`${loader.baseURL}/chat/completions`, {
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({ model: "Default", messages: [{ role: "user", content: "hi" }], stream: true, stream_options: { include_usage: true } }),
++    })
++    assert.match(res.headers.get("content-type"), /text\/event-stream/)
++    const text = await res.text()
++    assert.match(text, /"content":"你"/)
++    assert.match(text, /"reasoning_content":"想"/)
++    assert.match(text, /data: \[DONE\]/)
++    assert.match(text, /"usage"/)
++  } finally {
++    restore()
++  }
++})
++
++test("the model list follows the account, and premium rows are dropped on request", async () => {
++  const { restore } = installFetch()
++  try {
++    const hooks = await TabbitPlugin()
++    const provider = { models: {} }
++    const rows = await hooks.provider.models(provider, { auth })
++    assert.deepEqual(Object.keys(rows), ["Default", "Kimi-K3.1-Pro", "GLM-5.3-Flash"])
++
++    globalThis.magpie = { option: () => true }
++    const freeOnly = await hooks.provider.models(provider, { auth })
++    assert.deepEqual(Object.keys(freeOnly), ["Default", "GLM-5.3-Flash"])
++    delete globalThis.magpie
++  } finally {
++    restore()
++  }
++})
++
++test("usage reports the cycle as a percentage window", async () => {
++  const { restore } = installFetch()
++  try {
++    const hooks = await TabbitPlugin()
++    const u = await hooks.auth.usage(async () => auth)
++    assert.equal(u.plan, "Tabbit free")
++    assert.equal(u.windows[0].used, 12.18)
++    assert.equal(u.windows[0].unit, "%")
++    assert.equal(u.windows[0].resetsAt, "2026-11-09T16:00:00.000Z")
++  } finally {
++    restore()
++  }
++})
++
++test("a refused sign-in marks the account, and says so in words", async () => {
++  const original = globalThis.fetch
++  globalThis.fetch = async () => new Response(JSON.stringify({ message: "请先登录" }), { status: 401 })
++  try {
++    const hooks = await TabbitPlugin()
++    const loader = await hooks.auth.loader(async () => auth)
++    const res = await loader.fetch(`${loader.baseURL}/chat/completions`, {
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({ model: "Default", messages: [{ role: "user", content: "hi" }] }),
++    })
++    assert.equal(res.status, 401)
++    assert.equal(res.headers.get("x-magpie-sign-in"), "expired")
++  } finally {
++    globalThis.fetch = original
++  }
++})
++
++test("a premium-only model's 403 does not mark the sign-in", async () => {
++  const original = globalThis.fetch
++  globalThis.fetch = async (input, init = {}) => {
++    const path = new URL(typeof input === "string" ? input : input.url).pathname
++    if (path === "/api/v3/chat/rooms") return Response.json({ room_id: "r" })
++    return new Response(JSON.stringify({ detail: { message: "premium users only", code: 492 } }), { status: 403 })
++  }
++  try {
++    const hooks = await TabbitPlugin()
++    const loader = await hooks.auth.loader(async () => auth)
++    const res = await loader.fetch(`${loader.baseURL}/chat/completions`, {
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({ model: "Kimi-K3.1-Pro", messages: [{ role: "user", content: "hi" }] }),
++    })
++    assert.equal(res.status, 403)
++    assert.equal(res.headers.get("x-magpie-sign-in"), null)
++  } finally {
++    globalThis.fetch = original
++  }
++})
++
++test("credsOf accepts a bare JWT and a full cookie string", () => {
++  const bare = credsOf({ key: "aaa.bbb.ccc", metadata: { userId: "u9" } })
++  assert.match(bare.header, /token=aaa\.bbb\.ccc/)
++  assert.match(bare.header, /user_id=u9/)
++  const whole = credsOf({ key: "token=xyz; user_id=u2; managed=tab_browser" })
++  assert.equal(whole.token, "xyz")
++  assert.equal(whole.uid, "u2")
++  assert.equal(credsOf({ key: "" }), null)
++})
++
++test("the JWT's own claims name the account and its end", () => {
++  const payload = Buffer.from(JSON.stringify({ sub: "u-7", exp: 2000000000 })).toString("base64url")
++  const token = `h.${payload}.s`
++  const claims = claimsOf(token)
++  assert.equal(uidOfClaims(claims), "u-7")
++  assert.equal(expiresAt({ key: token }), new Date(2000000000 * 1000).toISOString())
++  assert.equal(stale({ key: token }), false)
++  const past = Buffer.from(JSON.stringify({ sub: "u", exp: 1 })).toString("base64url")
++  assert.equal(stale({ key: `h.${past}.s` }), true)
++})
++
++test("a follow-up in the same session reuses the room and sends only the new message", async () => {
++  const { calls, restore } = installFetch()
++  try {
++    const hooks = await TabbitPlugin()
++    _internal.rooms.clear()
++    const loader = await hooks.auth.loader(async () => auth)
++    const send = (messages) =>
++      loader.fetch(`${loader.baseURL}/chat/completions`, {
++        method: "POST",
++        headers: { "content-type": "application/json", "x-magpie-tabbit-session": "s-room" },
++        body: JSON.stringify({ model: "Default", messages, stream: false }),
++      })
++
++    await send([{ role: "user", content: "我叫小明" }])
++    const first = calls.filter((c) => c.path === "/api/v3/chat/rooms" && c.method === "POST").length
++    assert.equal(first, 1)
++
++    await send([
++      { role: "user", content: "我叫小明" },
++      { role: "assistant", content: "记住了" },
++      { role: "user", content: "我叫什么" },
++    ])
++    // no second room: the transcript continues the one we have
++    assert.equal(calls.filter((c) => c.path === "/api/v3/chat/rooms" && c.method === "POST").length, 1)
++    const runs = calls.filter((c) => c.path.endsWith("/runs"))
++    assert.equal(runs.length, 2)
++    const second = JSON.parse(runs[1].body)
++    assert.equal(second.input_payload.content, "我叫什么")
++    assert.equal(second.input_payload.parent_message_id, "a1")
++  } finally {
++    restore()
++    _internal.rooms.clear()
++  }
++})
++
++test("a different session gets its own room and a flattened prompt", async () => {
++  const { calls, restore } = installFetch()
++  try {
++    const hooks = await TabbitPlugin()
++    _internal.rooms.clear()
++    const loader = await hooks.auth.loader(async () => auth)
++    await loader.fetch(`${loader.baseURL}/chat/completions`, {
++      method: "POST",
++      headers: { "content-type": "application/json", "x-magpie-tabbit-session": "s-a" },
++      body: JSON.stringify({ model: "Default", messages: [{ role: "user", content: "一" }], stream: false }),
++    })
++    await loader.fetch(`${loader.baseURL}/chat/completions`, {
++      method: "POST",
++      headers: { "content-type": "application/json", "x-magpie-tabbit-session": "s-b" },
++      body: JSON.stringify({
++        model: "Default",
++        messages: [
++          { role: "system", content: "简洁" },
++          { role: "user", content: "一" },
++          { role: "assistant", content: "二" },
++          { role: "user", content: "三" },
++        ],
++        stream: false,
++      }),
++    })
++    assert.equal(calls.filter((c) => c.path === "/api/v3/chat/rooms" && c.method === "POST").length, 2)
++    const runs = calls.filter((c) => c.path.endsWith("/runs"))
++    const body = JSON.parse(runs[1].body)
++    assert.match(body.input_payload.content, /\[system\]/)
++    assert.match(body.input_payload.content, /user: 一/)
++    assert.match(body.input_payload.content, /assistant: 二/)
++    assert.match(body.input_payload.content, /user: 三$/)
++  } finally {
++    restore()
++    _internal.rooms.clear()
++  }
++})
+diff --git a/packages/tabbit/tests/sse.test.mjs b/packages/tabbit/tests/sse.test.mjs
+new file mode 100644
+index 0000000..b177f0c
+--- /dev/null
++++ b/packages/tabbit/tests/sse.test.mjs
+@@ -0,0 +1,107 @@
++// Reading a turn: the recorded frames of a real one, replayed.
++
++import test from "node:test"
++import assert from "node:assert/strict"
++import { parseSSE, turnDeltas, readTurn } from "../src/sse.mjs"
++
++// frame builds one SSE event as the wire carries it.
++const frame = (event, data, id) => `${id ? `id: ${id}\n` : ""}event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
++
++function responseOf(chunks) {
++  const encoder = new TextEncoder()
++  return new Response(
++    new ReadableStream({
++      start(controller) {
++        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
++        controller.close()
++      },
++    }),
++    { status: 200, headers: { "content-type": "text/event-stream" } },
++  )
++}
++
++// A turn exactly as measured: thinking, then the answer, then the end.
++const GOOD = [
++  frame("snapshot_begin", { payload: {} }),
++  frame("message_history", {
++    payload: { messages: [{ message_id: "a0", role: "user", content: "1+1=?" }, { message_id: "a1", role: "assistant", content: "" }] },
++  }),
++  frame("active_runs_snapshot", { payload: { runs: [{ run_id: "r1", status: "RUNNING", assistant_message_id: "a1" }] } }),
++  frame("user_message_created", { payload: { message_id: "m-user" } }),
++  frame("assistant_message_started", { payload: { run_id: "r1", message_id: "a1" } }),
++  frame("event_message_chunk", { payload: { chunk_type: "thinking", chunk_payload: { reasoning_content: "想想" } } }),
++  frame("event_message_chunk", { payload: { chunk_type: "thinking_finished", chunk_payload: {} } }),
++  frame("assistant_message_delta", { payload: { chunk_type: "message_chunk", chunk_payload: { content: "4" } } }),
++  frame("session_title_updated", { payload: { title: "算术" } }),
++  frame("assistant_message_finished", { payload: { message_id: "a1", model_name: null } }),
++  frame("run_completed", { payload: { status: "COMPLETED" } }, "e1"),
++]
++
++test("parseSSE splits events, data and ids", async () => {
++  const out = []
++  for await (const ev of parseSSE(responseOf(["event: a\ndata: {\"x\":1}\n\n", "id: 9\nevent: b\ndata: he", "llo\n\n"]).body)) out.push(ev)
++  assert.deepEqual(out[0], { event: "a", data: '{"x":1}', id: null })
++  assert.deepEqual(out[1], { event: "b", data: "hello", id: "9" })
++})
++
++test("a good turn gives text, thinking, ids and completed", async () => {
++  const state = await readTurn(responseOf(GOOD))
++  assert.equal(state.text, "4")
++  assert.equal(state.reasoning, "想想")
++  assert.equal(state.completed, true)
++  assert.equal(state.truncated, false)
++  assert.equal(state.assistantMessageId, "a1")
++  assert.equal(state.userMessageId, "m-user")
++  assert.equal(state.runId, "r1")
++  assert.equal(state.title, "算术")
++  assert.equal(state.lastEventId, "e1")
++})
++
++test("the deltas arrive in order, thinking before text", async () => {
++  const kinds = []
++  for await (const part of turnDeltas(responseOf(GOOD))) {
++    if (part.type === "thinking") kinds.push(`think:${part.value}`)
++    if (part.type === "text") kinds.push(`text:${part.value}`)
++  }
++  assert.deepEqual(kinds, ["think:想想", "text:4"])
++})
++
++test("a turn that stops early is truncated, not silently complete", async () => {
++  const state = await readTurn(responseOf(GOOD.slice(0, 8)))
++  assert.equal(state.completed, false)
++  assert.equal(state.truncated, true)
++  assert.equal(state.text, "4")
++})
++
++test("a failed turn is reported as failed", async () => {
++  const state = await readTurn(responseOf([...GOOD.slice(0, 8), frame("run_failed", { payload: { status: "FAILED", reason: "boom" } })]))
++  assert.deepEqual(state.failed, { status: "FAILED", reason: "boom" })
++  assert.equal(state.completed, false)
++  assert.equal(state.truncated, false)
++})
++
++test("a rejoin's snapshot recovers text already sent", async () => {
++  const chunk = frame("message_history", {
++    payload: { messages: [{ message_id: "a1", role: "assistant", content: "前半段", reasoning_content: "想过了" }] },
++  })
++  const runs = frame("active_runs_snapshot", { payload: { runs: [{ run_id: "r1", assistant_message_id: "a1" }] } })
++  const state = await readTurn(responseOf([chunk, runs, frame("assistant_message_delta", { payload: { chunk_payload: { content: "后半段" } } }), frame("run_completed", { payload: {} })]))
++  assert.equal(state.text, "前半段后半段")
++  assert.equal(state.reasoning, "想过了")
++})
++
++test("a new turn's snapshot is not replayed as this turn's text", async () => {
++  // The room's history holds the previous answer; only the assistant message
++  // the active run names is this turn's, and that one is still empty.
++  const history = frame("message_history", {
++    payload: { messages: [
++      { message_id: "old", role: "assistant", content: "上一轮的完整回答" },
++      { message_id: "new", role: "user", content: "新问题" },
++      { message_id: "cur", role: "assistant", content: "" },
++    ] },
++  })
++  const runs = frame("active_runs_snapshot", { payload: { runs: [{ run_id: "r2", assistant_message_id: "cur" }] } })
++  const deltas = frame("assistant_message_delta", { payload: { chunk_payload: { content: "新回答" } } })
++  const state = await readTurn(responseOf([history, runs, deltas, frame("run_completed", { payload: {} })]))
++  assert.equal(state.text, "新回答")
++})
+diff --git a/registry.json b/registry.json
+index fa8ca20..b6f5e0b 100644
+--- a/registry.json
++++ b/registry.json
+@@ -195,6 +195,8 @@
+     { "package": "@magpie-community/opencode-astudio-auth", "name": "AStudio", "providers": ["astudio"], "community": true,
+       "summary": { "en": "Unofficial AStudio (iFLYTEK Astron Studio desktop): reuse the desktop sign-in to serve its Responses model gateway, with the live model catalog, daily login-points check-in and points balance. Desktop discovery runs on Windows (registry lookup), with a paste-token fallback. Differs from Providers Hub's hub-astudio, which signs in on a local page (SMS, password or WeChat QR) and calls chat/completions; on one account both share the same daily points pool.", "zh": "非官方 AStudio（科大讯飞 Astron Studio 桌面端）：复用桌面端登录态接入其模型网关，含实时模型目录、每日登录积分签到与积分余额。桌面端发现仅 Windows（注册表定位），另有粘贴凭据方式。与 Providers Hub 的 hub-astudio 不同：那边在本地登录页用短信、密码或微信扫码登录，走 chat/completions；同一账号两边共用一个每日积分池。" } },
+     { "package": "@magpie-community/opencode-agnes-code-auth", "name": "Agnes Code", "providers": ["agnes-code"], "community": true,
+-      "summary": { "en": "Unofficial Agnes Code desktop: reuse the desktop sign-in for its OpenAI-compatible gateway, with the live model catalog, daily credit check-in and points balance. Desktop decryption is Windows-only; a paste-token method covers the rest. Differs from opencode-agnes-auth (`agnes`), which signs in to Agnes AI international in Chrome and meters that product's plans and USD balance: this one serves the Agnes Code desktop product and its daily credits.", "zh": "非官方 Agnes Code 桌面端：复用桌面端登录态接入其 OpenAI 兼容网关，含实时模型目录、每日积分签到与余额显示。桌面端解密仅限 Windows，其余平台用粘贴 accessToken。与 opencode-agnes-auth（`agnes`）不同：那边在 Chrome 里登录 Agnes AI 国际版、显示该产品的套餐与美元余额；本包服务 Agnes Code 桌面端产品与它的每日积分。" } }
++      "summary": { "en": "Unofficial Agnes Code desktop: reuse the desktop sign-in for its OpenAI-compatible gateway, with the live model catalog, daily credit check-in and points balance. Desktop decryption is Windows-only; a paste-token method covers the rest. Differs from opencode-agnes-auth (`agnes`), which signs in to Agnes AI international in Chrome and meters that product's plans and USD balance: this one serves the Agnes Code desktop product and its daily credits.", "zh": "非官方 Agnes Code 桌面端：复用桌面端登录态接入其 OpenAI 兼容网关，含实时模型目录、每日积分签到与余额显示。桌面端解密仅限 Windows，其余平台用粘贴 accessToken。与 opencode-agnes-auth（`agnes`）不同：那边在 Chrome 里登录 Agnes AI 国际版、显示该产品的套餐与美元余额；本包服务 Agnes Code 桌面端产品与它的每日积分。" } },
++    { "package": "@magpie-community/opencode-tabbit-auth", "name": "Tabbit", "icon": "https://web.tabbit.com/favicon.ico", "providers": ["tabbit"], "community": true,
++      "summary": { "en": "Unofficial Tabbit (web.tabbit.com) provider: reuse the Tabbit Browser sign-in on this computer to serve its chat models, with the account's live catalog, cycle usage and the daily check-in. No browser automation: a turn is Tabbit's own room → run → event-stream calls. Client tool calls are not available (Tabbit's tools are its own).", "zh": "非官方 Tabbit（web.tabbit.com）插件：复用本机 Tabbit 浏览器的登录态接入它的聊天模型，含账号实时模型目录、周期用量与每日签到。不走浏览器自动化：一轮对话就是 Tabbit 自己的 建房间 → 发起 → 事件流。不支持客户端工具调用（Tabbit 的工具是它自己的）。" } }
+   ]
+ }
