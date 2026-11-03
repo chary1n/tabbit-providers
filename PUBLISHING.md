@@ -31,7 +31,9 @@ publish/
 | 版本 | 时间 | 状态 |
 |---|---|---|
 | 0.1.0 | 2026-11-03 | ✅ 已上线（`latest`），`npm i magpie-tabbit-provider` 可用 |
-| 0.1.1 | 2026-11-03 | ⏳ 代码已改好（review 修复），待发布：`npm publish --otp=<6位码>` |
+| 0.1.1 | 2026-11-03 | ✅ 已上线（第一轮 review 修复） |
+| 0.1.2 | 2026-11-03 | ✅ 已上线（第二轮 review 修复；发布后约 5 分钟才变成 `latest`） |
+| 0.1.3 | 2026-11-03 | ✅ 已上线，`latest`（与 0.1.2 同一份代码，为绕开 E409 而 bump） |
 
 已落地的分发入口：
 
@@ -50,6 +52,16 @@ publish/
    真实版本随后替换 `latest`，占位版本留着无害，不需要任何人工批准。
 3. 如果报 `You cannot publish over the previously published versions: X`，说明 X 已经在线上，
    `npm view magpie-tabbit-provider version` 确认一下；要再发就 bump 版本号。
+
+### 发版时踩到的两件事（2026-11-03 实测）
+
+1. **同一个版本号重发会报 `E409 Cannot publish over previously staged version "X"`。**
+   npm 现在把「带 bypass 2FA 的 token」的直接发布也走一遍暂存/传播，重发同一版本会被挡。
+   `npm view` 也可能还没更新（0.1.2 从发布到 `latest` 生效用了约 5 分钟）。
+   **遇到 E409 就 bump 版本号重发**，不要反复重试同一个号。
+2. **GitHub Actions 直接 publish 会 `404 ... is not in this registry`**，即使它已经签好了
+   provenance。原因就是 npm 那边还没配 **Trusted Publisher**（OIDC 不被这个包信任）。
+   去 npmjs.com → 包 → Settings → Trusted publisher 填好后，工作流才发得出去。
 
 ## 自动发布（不用每次给 OTP）
 
