@@ -16,13 +16,28 @@
 //
 // `run_failed` replaces the last three when the turn does not finish.
 
-import { STREAM_TIMEOUT } from "./api.mjs"
+import { streamTimeoutMs } from "./api.mjs"
 
 // parseSSE turns a byte stream into {event, data, id} records. It is a plain
 // reader, not an EventSource: no reconnect, no last-event-id store — the
 // caller decides whether to rejoin.
 export async function* parseSSE(body, { signal } = {}) {
   const reader = body.getReader()
+  // A pending reader.read() is not woken by signal.aborted on its own: cancel
+  // the body so a stream that has gone quiet ends when its bound says so.
+  const wake = () => {
+    try {
+      const cancelled = reader.cancel(signal?.reason)
+      // cancel() is a promise; a rejected one here is the stream already gone
+      if (cancelled && typeof cancelled.catch === "function") cancelled.catch(() => {})
+    } catch {
+      /* already gone */
+    }
+  }
+  if (signal) {
+    if (signal.aborted) wake()
+    else signal.addEventListener("abort", wake, { once: true })
+  }
   const decoder = new TextDecoder()
   let buffer = ""
   let event = ""
@@ -60,6 +75,7 @@ export async function* parseSSE(body, { signal } = {}) {
     }
     yield* flush()
   } finally {
+    signal?.removeEventListener?.("abort", wake)
     try {
       await reader.cancel()
     } catch {
@@ -81,9 +97,20 @@ function safeJSON(text) {
 //
 // A stream that stops without `run_completed` is reported as truncated: an
 // answer cut in half that looks whole is the failure worth naming.
-export async function* turnDeltas(response, { signal, timeoutMs = STREAM_TIMEOUT } = {}) {
+export async function* turnDeltas(response, { signal, timeoutMs = streamTimeoutMs(), onTimeout } = {}) {
   const reason = new AbortController()
-  const timer = setTimeout(() => reason.abort(new Error("Tabbit's turn timed out")), timeoutMs)
+  let timedOut = false
+  const timer = setTimeout(() => {
+    timedOut = true
+    reason.abort(new Error("Tabbit's turn timed out"))
+    // A timed-out turn keeps running at Tabbit: stop it so it stops spending
+    // the account's allowance.
+    try {
+      onTimeout?.()
+    } catch {
+      /* stopping is best effort */
+    }
+  }, timeoutMs)
   const onAbort = () => reason.abort(signal?.reason)
   if (signal) {
     if (signal.aborted) onAbort()
@@ -180,6 +207,7 @@ export async function* turnDeltas(response, { signal, timeoutMs = STREAM_TIMEOUT
   // produced no text at all. An empty reply that looks finished is an answer
   // an agent will take as the answer.
   if (!state.completed && !state.failed) state.truncated = true
+  if (timedOut) state.timedOut = true
   yield { type: "end", state }
 }
 

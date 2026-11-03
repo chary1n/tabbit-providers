@@ -229,6 +229,16 @@ function errorResponse(error) {
 function streamTurn(response, { model, plan, body, signal, onEnd, onCancel }) {
   const encoder = new TextEncoder()
   const stopReading = new AbortController()
+  let stopped = false
+  const stopOnce = () => {
+    if (stopped) return
+    stopped = true
+    try {
+      onCancel?.()
+    } catch {
+      /* stopping is best effort */
+    }
+  }
   return new ReadableStream({
     async start(controller) {
       const send = (text) => {
@@ -238,10 +248,19 @@ function streamTurn(response, { model, plan, body, signal, onEnd, onCancel }) {
           /* the reader went away */
         }
       }
+      // magpie's way of giving up is aborting the request's signal; stop the
+      // run then too, not only when the reader is cancelled.
+      if (signal) {
+        if (signal.aborted) stopOnce()
+        else signal.addEventListener("abort", stopOnce, { once: true })
+      }
       let text = ""
       try {
         send(chunkLine(model, { role: "assistant", content: "" }))
-        for await (const part of turnDeltas(response, { signal: signal ? AbortSignal.any([signal, stopReading.signal]) : stopReading.signal })) {
+        for await (const part of turnDeltas(response, {
+          signal: signal ? AbortSignal.any([signal, stopReading.signal]) : stopReading.signal,
+          onTimeout: stopOnce,
+        })) {
           if (part.type === "thinking" && part.value) send(chunkLine(model, { reasoning_content: part.value }))
           else if (part.type === "text" && part.value) {
             text += part.value
@@ -262,7 +281,7 @@ function streamTurn(response, { model, plan, body, signal, onEnd, onCancel }) {
                   total_tokens: estimateTokens(plan.content) + estimateTokens(text),
                 }
               : null
-            send(chunkLine(model, {}, { finish: part.state.truncated ? "length" : "stop", usage }))
+            send(chunkLine(model, {}, { finish: "stop", usage }))
             send("data: [DONE]\n\n")
             onEnd?.(part.state)
           }
@@ -285,11 +304,8 @@ function streamTurn(response, { model, plan, body, signal, onEnd, onCancel }) {
       // producing would spend the account's allowance for an answer nobody
       // will read.
       stopReading.abort(new Error("cancelled"))
-      try {
-        await onCancel?.()
-      } catch {
-        /* stopping is best effort */
-      }
+      stopOnce()
+      signal?.removeEventListener?.("abort", stopOnce)
     },
   })
 }
@@ -358,7 +374,7 @@ function createPlugin() {
     let text = ""
     let reasoning = ""
     let assistantId = null
-    for await (const part of turnDeltas(response, { signal: request.signal })) {
+    for await (const part of turnDeltas(response, { signal: request.signal, onTimeout: () => stop(creds, room) })) {
       if (part.type === "text") text += part.value
       else if (part.type === "thinking") reasoning += part.value
       else if (part.type === "end") {

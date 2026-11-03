@@ -381,49 +381,168 @@ test("rooms are keyed by account as well as session", async () => {
     let current = { type: "api", key: jwtFor("acct-a") }
     const hooks = await TabbitPlugin()
     const loader = await hooks.auth.loader(async () => current)
-    const send = () =>
-      loader.fetch(`${loader.baseURL}/chat/completions`, {
+    const send = (key, messages) => {
+      current = { type: "api", key }
+      return loader.fetch(`${loader.baseURL}/chat/completions`, {
         method: "POST",
         headers: { "content-type": "application/json", "x-magpie-tabbit-session": "shared" },
-        body: chatBody(),
+        body: JSON.stringify({ model: "Default", messages, stream: false }),
       })
-    await send()
-    current = { type: "api", key: jwtFor("acct-b") }
-    await send()
-    // the second account must not continue the first account's room
-    assert.equal(calls.filter((c) => c.path === "/api/v3/chat/rooms" && c.method === "POST").length, 2)
+    }
+    await send(jwtFor("acct-a"), [{ role: "user", content: "我叫小明" }])
+    // B continues A's transcript: with a session-only key this would reuse A's
+    // room, which is the bug. With the account in the key it must not.
+    await send(jwtFor("acct-b"), [
+      { role: "user", content: "我叫小明" },
+      { role: "assistant", content: "记住了" },
+      { role: "user", content: "我叫什么" },
+    ])
+    const rooms = calls.filter((c) => c.path === "/api/v3/chat/rooms" && c.method === "POST")
+    assert.equal(rooms.length, 2, "B reused A's room")
+    const runs = calls.filter((c) => c.path.endsWith("/runs")).map((c) => c.path)
+    assert.equal(runs.length, 2)
+    assert.notEqual(runs[0].split("/")[5], runs[1].split("/")[5], "the same room was used for both accounts")
   } finally {
     restore()
     _internal.rooms.clear()
   }
 })
 
-test("cancelling the stream asks Tabbit to stop the run", async () => {
+// A stub that behaves like a real fetch: refuses at once when its signal is
+// already aborted, and errors the body when the signal aborts mid-read.
+function abortableTabbit({ encoder, calls, onJoin }) {
+  return async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.url)
+    const path = url.pathname
+    const method = (init.method ?? "GET").toUpperCase()
+    if (init.signal?.aborted) throw init.signal.reason ?? new Error("aborted")
+    calls.push({ method, path, signal: init.signal })
+    if (path === "/api/v3/chat/rooms") return Response.json({ room_id: "room-abort" })
+    if (path.endsWith("/runs")) return Response.json({ run_id: "r1" })
+    if (path.endsWith("/join")) {
+      const stream = new ReadableStream({
+        start(c) {
+          c.enqueue(encoder.encode(frame("assistant_message_started", { payload: { run_id: "r1", message_id: "a1" } })))
+          c.enqueue(encoder.encode(frame("assistant_message_delta", { payload: { chunk_payload: { content: "半" } } })))
+          const onAbort = () => {
+            try {
+              c.error(init.signal.reason ?? new Error("aborted"))
+            } catch {}
+          }
+          if (init.signal) init.signal.addEventListener("abort", onAbort, { once: true })
+        },
+        cancel() {},
+      })
+      return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } })
+    }
+    return new Response("{}", { status: 200 })
+  }
+}
+
+test("aborting the request mid-stream asks Tabbit to stop the run", async () => {
+  const encoder = new TextEncoder()
+  const calls = []
+  const original = globalThis.fetch
+  globalThis.fetch = abortableTabbit({ encoder, calls })
+  try {
+    const ctrl = new AbortController()
+    const hooks = await TabbitPlugin()
+    const loader = await hooks.auth.loader(async () => auth)
+    const res = await loader.fetch(`${loader.baseURL}/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "Default", messages: [{ role: "user", content: "hi" }], stream: true }),
+      signal: ctrl.signal,
+    })
+    const reader = res.body.getReader()
+    await reader.read()
+    ctrl.abort(new Error("client gave up"))
+    try {
+      await reader.read()
+    } catch {
+      /* the body errors, as a real fetch's does */
+    }
+    await new Promise((r) => setTimeout(r, 150))
+    const stopCall = calls.find((c) => c.path === "/proxy/v0/chat/stop/")
+    assert.ok(stopCall, "stop was never sent: " + JSON.stringify(calls.map((c) => c.path)))
+    // and it must not ride the request's already-aborted signal
+    assert.equal(stopCall.signal?.aborted, false, "stop used the aborted request signal")
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test("a turn longer than the request timeout still finishes", async () => {
+  const old = process.env.TABBIT_TIMEOUT_MS
+  process.env.TABBIT_TIMEOUT_MS = "30"
+  const encoder = new TextEncoder()
+  const original = globalThis.fetch
+  globalThis.fetch = async (input, init = {}) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname
+    if (init.signal?.aborted) throw init.signal.reason ?? new Error("aborted")
+    if (path === "/api/v3/chat/rooms") return Response.json({ room_id: "room-long" })
+    if (path.endsWith("/runs")) return Response.json({ run_id: "r1" })
+    if (path.endsWith("/join")) {
+      const stream = new ReadableStream({
+        async start(c) {
+          const onAbort = () => {
+            try {
+              c.error(init.signal.reason ?? new Error("timed out"))
+            } catch {}
+          }
+          if (init.signal) init.signal.addEventListener("abort", onAbort, { once: true })
+          c.enqueue(encoder.encode(frame("assistant_message_started", { payload: { run_id: "r1", message_id: "a1" } })))
+          // far longer than the 30 ms request timeout set above
+          await new Promise((r) => setTimeout(r, 180))
+          c.enqueue(encoder.encode(frame("assistant_message_delta", { payload: { chunk_payload: { content: "慢" } } })))
+          c.enqueue(encoder.encode(frame("run_completed", { payload: {} })))
+          c.close()
+        },
+        cancel() {},
+      })
+      return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } })
+    }
+    return new Response("{}", { status: 200 })
+  }
+  try {
+    const res = await fetchWith(auth, chatBody())
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(body.choices[0].message.content, "慢")
+  } finally {
+    globalThis.fetch = original
+    if (old === undefined) delete process.env.TABBIT_TIMEOUT_MS
+    else process.env.TABBIT_TIMEOUT_MS = old
+  }
+})
+
+test("a quiet stream ends at the turn timeout and stops the run", async () => {
+  const old = process.env.TABBIT_STREAM_TIMEOUT_MS
+  process.env.TABBIT_STREAM_TIMEOUT_MS = "120"
   const encoder = new TextEncoder()
   const calls = []
   const original = globalThis.fetch
   globalThis.fetch = async (input, init = {}) => {
     const path = new URL(typeof input === "string" ? input : input.url).pathname
     const method = (init.method ?? "GET").toUpperCase()
-    calls.push({ method, path })
-    if (path === "/api/v3/chat/rooms") return Response.json({ room_id: "room-cancel" })
+    if (init.signal?.aborted) throw init.signal.reason ?? new Error("aborted")
+    calls.push({ method, path, signal: init.signal })
+    if (path === "/api/v3/chat/rooms") return Response.json({ room_id: "room-quiet" })
     if (path.endsWith("/runs")) return Response.json({ run_id: "r1" })
     if (path.endsWith("/join")) {
-      return new Response(
-        new ReadableStream({
-          start(c) {
-            c.enqueue(encoder.encode(frame("assistant_message_started", { payload: { run_id: "r1", message_id: "a1" } })))
-            c.enqueue(encoder.encode(frame("assistant_message_delta", { payload: { chunk_payload: { content: "半" } } })))
-            // keep it open: the reader goes away mid-stream
-          },
-          cancel() {},
-        }),
-        { status: 200, headers: { "content-type": "text/event-stream" } },
-      )
+      const stream = new ReadableStream({
+        start(c) {
+          c.enqueue(encoder.encode(frame("assistant_message_started", { payload: { run_id: "r1", message_id: "a1" } })))
+          // then nothing at all: a stream that went quiet
+        },
+        cancel() {},
+      })
+      return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } })
     }
     return new Response("{}", { status: 200 })
   }
   try {
+    const started = Date.now()
     const hooks = await TabbitPlugin()
     const loader = await hooks.auth.loader(async () => auth)
     const res = await loader.fetch(`${loader.baseURL}/chat/completions`, {
@@ -431,13 +550,55 @@ test("cancelling the stream asks Tabbit to stop the run", async () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ model: "Default", messages: [{ role: "user", content: "hi" }], stream: true }),
     })
-    const reader = res.body.getReader()
-    await reader.read()
-    await reader.cancel()
-    await new Promise((r) => setTimeout(r, 150))
-    assert.ok(calls.some((c) => c.path === "/proxy/v0/chat/stop/"), "stop was never called: " + JSON.stringify(calls))
+    const text = await res.text()
+    const elapsed = Date.now() - started
+    assert.ok(elapsed < 2000, "took " + elapsed + "ms, the quiet stream was not woken")
+    assert.match(text, /"error"/)
+    assert.ok(calls.some((c) => c.path === "/proxy/v0/chat/stop/"), "stop was never sent")
   } finally {
     globalThis.fetch = original
+    if (old === undefined) delete process.env.TABBIT_STREAM_TIMEOUT_MS
+    else process.env.TABBIT_STREAM_TIMEOUT_MS = old
+  }
+})
+
+test("a stream cut after the turn starts is an error event, and the room is not remembered", async () => {
+  const encoder = new TextEncoder()
+  const original = globalThis.fetch
+  globalThis.fetch = async (input, init = {}) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname
+    if (path === "/api/v3/chat/rooms") return Response.json({ room_id: "room-cut" })
+    if (path.endsWith("/runs")) return Response.json({ run_id: "r1" })
+    if (path.endsWith("/join")) {
+      const stream = new ReadableStream({
+        start(c) {
+          c.enqueue(encoder.encode(frame("snapshot_begin", { payload: {} })))
+          c.enqueue(encoder.encode(frame("assistant_message_started", { payload: { run_id: "r1", message_id: "a1" } })))
+          c.close() // cut here, no run_completed
+        },
+        cancel() {},
+      })
+      return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } })
+    }
+    return new Response("{}", { status: 200 })
+  }
+  try {
+    _internal.rooms.clear()
+    const hooks = await TabbitPlugin()
+    const loader = await hooks.auth.loader(async () => auth)
+    const res = await loader.fetch(`${loader.baseURL}/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-magpie-tabbit-session": "cut" },
+      body: JSON.stringify({ model: "Default", messages: [{ role: "user", content: "hi" }], stream: true }),
+    })
+    const text = await res.text()
+    assert.match(text, /"error"/)
+    assert.match(text, /data: \[DONE\]/)
+    assert.doesNotMatch(text, /"finish_reason":"stop"/)
+    assert.equal(_internal.rooms.size, 0, "a cut turn was remembered as a room")
+  } finally {
+    globalThis.fetch = original
+    _internal.rooms.clear()
   }
 })
 

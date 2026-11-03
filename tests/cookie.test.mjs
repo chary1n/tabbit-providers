@@ -1,5 +1,9 @@
 // The cookie store: a synthetic Chromium v10 blob, decrypted with a known
 // password, and the store lookup that finds the file.
+//
+// Every temp directory a test makes is removed before the test returns: these
+// build whole cookie stores, and a test run must not leave one behind — the
+// same point the sign-in copy itself makes.
 
 import test from "node:test"
 import assert from "node:assert/strict"
@@ -11,6 +15,23 @@ import { decryptValue, cookieStore, copyStore, profileDirs, readCookies, desktop
 
 const HOST = "web.tabbit.com"
 const PASSWORD = "test-password"
+
+const made = []
+function tmp(prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix))
+  made.push(dir)
+  return dir
+}
+// withCleanup runs a test body and removes every temp directory it made.
+function withCleanup(name, body) {
+  return test(name, async (ctx) => {
+    try {
+      await body(ctx)
+    } finally {
+      for (const dir of made.splice(0)) fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
 
 // seal makes the blob Chromium's own macOS encryption makes: AES-128-CBC
 // under the keychain password, `v10`, a 32-byte SHA-256 of the host in
@@ -49,32 +70,32 @@ test("profileDirs honours an explicit override first", () => {
   assert.equal(dirs[0], "/tmp/one")
 })
 
-test("cookieStore finds Default/Cookies under a profile root", () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tabbit-test-"))
+withCleanup("cookieStore finds Default/Cookies under a profile root", () => {
+  const root = tmp("tabbit-test-")
   fs.mkdirSync(path.join(root, "Default"), { recursive: true })
   fs.writeFileSync(path.join(root, "Default", "Cookies"), "")
   assert.equal(cookieStore([root]), path.join(root, "Default", "Cookies"))
   assert.equal(cookieStore([path.join(root, "missing")]), null)
 })
 
-test("copyStore copies the database and its WAL", () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tabbit-test-"))
+withCleanup("copyStore copies the database and its WAL", () => {
+  const root = tmp("tabbit-test-")
   const file = path.join(root, "Cookies")
   fs.writeFileSync(file, "db")
   fs.writeFileSync(file + "-wal", "wal")
-  const copy = copyStore(file, fs.mkdtempSync(path.join(os.tmpdir(), "tabbit-copy-")))
+  const copy = copyStore(file, tmp("tabbit-copy-"))
   assert.equal(fs.readFileSync(copy, "utf8"), "db")
   assert.equal(fs.readFileSync(copy + "-wal", "utf8"), "wal")
 })
 
-test("readCookies reads token and user_id back out of a real sqlite file", () => {
+withCleanup("readCookies reads token and user_id back out of a real sqlite file", () => {
   let DatabaseSync
   try {
     DatabaseSync = globalThis.process.getBuiltinModule("node:sqlite").DatabaseSync
   } catch {
     return // older Node: the plugin says so at runtime too
   }
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tabbit-test-"))
+  const root = tmp("tabbit-test-")
   const file = path.join(root, "Cookies")
   const db = new DatabaseSync(file)
   db.exec("create table cookies(host_key text, name text, value text, encrypted_value blob)")
@@ -87,8 +108,8 @@ test("readCookies reads token and user_id back out of a real sqlite file", () =>
   assert.equal(rows.find((r) => r.name === "user_id").value, "u-1")
 })
 
-// ---- review round: the temp copy must not survive a sign-in ---------------
-
+// storeWith builds a real cookie store holding `token` (or none), under a temp
+// directory the caller's cleanup removes.
 function storeWith(token) {
   let DatabaseSync
   try {
@@ -96,7 +117,7 @@ function storeWith(token) {
   } catch {
     return null
   }
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tabbit-store-"))
+  const root = tmp("tabbit-store-")
   const file = path.join(root, "Cookies")
   const db = new DatabaseSync(file)
   db.exec("create table cookies(host_key text, name text, value text, encrypted_value blob)")
@@ -106,20 +127,20 @@ function storeWith(token) {
   return file
 }
 
-test("a successful desktop sign-in leaves no copy of the cookie store", () => {
+withCleanup("a successful desktop sign-in leaves no copy of the cookie store", () => {
   const file = storeWith("tok-desktop")
   if (!file) return
-  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "tabbit-parent-"))
+  const parent = tmp("tabbit-parent-")
   const sign = desktopSignIn({ store: file, password: PASSWORD, tmpParent: parent, platform: "darwin" })
   assert.match(sign.key, /token=tok-desktop/)
   assert.equal(sign.userId, "u-9")
   assert.deepEqual(fs.readdirSync(parent), [])
 })
 
-test("a failed desktop sign-in leaves no copy either", () => {
+withCleanup("a failed desktop sign-in leaves no copy either", () => {
   const file = storeWith(null)
   if (!file) return
-  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "tabbit-parent-"))
+  const parent = tmp("tabbit-parent-")
   assert.throws(() => desktopSignIn({ store: file, password: PASSWORD, tmpParent: parent, platform: "darwin" }), /not signed in/)
   assert.deepEqual(fs.readdirSync(parent), [])
 })

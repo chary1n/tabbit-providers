@@ -28,10 +28,16 @@ export const UA =
 export const DEVICE_HASH =
   "3713eb6543ed2726194a44f52cc053818ff123110f55cad8062070649ac9a40c"
 
+// A turn's own length is bounded by STREAM_TIMEOUT, never by this: this bounds
+// one request's connect/headers (and, for the calls that read a small JSON
+// body, the body). Read lazily so a test can shrink it.
 export const TIMEOUT = 30_000
+export const timeoutMs = () => Number(process.env.TABBIT_TIMEOUT_MS || TIMEOUT)
 
 // A turn that never answers would otherwise hang the agent forever.
-export const STREAM_TIMEOUT = Number(process.env.TABBIT_STREAM_TIMEOUT_MS || 300_000)
+// A turn's whole length. Read lazily so a test can shrink it.
+export const STREAM_TIMEOUT = 300_000
+export const streamTimeoutMs = () => Number(process.env.TABBIT_STREAM_TIMEOUT_MS || STREAM_TIMEOUT)
 
 const clean = (v) => (typeof v === "string" ? v.trim() : "")
 
@@ -119,11 +125,20 @@ function safeJSON(text) {
   }
 }
 
-async function call(creds, path, init = {}, signal) {
+async function call(creds, path, init = {}, signal, { totalTimeout = true } = {}) {
+  // A streamed turn may run for minutes; Bun's fetch applies this signal to
+  // reading the body too, so a total timeout would cut a slow answer in half.
+  // `join` therefore passes its own signal only and lets STREAM_TIMEOUT bound
+  // the turn; every other call keeps the total timeout.
+  const bound = totalTimeout
+    ? signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs())])
+      : AbortSignal.timeout(timeoutMs())
+    : signal
   const res = await fetch(BASE + path, {
     ...init,
     headers: headersFor(creds, init.headers),
-    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(TIMEOUT)]) : AbortSignal.timeout(TIMEOUT),
+    ...(bound ? { signal: bound } : {}),
     redirect: "error",
   })
   if (res.status === 401 || res.status === 403) {
@@ -252,6 +267,7 @@ export async function join(creds, room, { lastEventId = null, signal } = {}) {
       }),
     },
     signal,
+    { totalTimeout: false },
   )
   return res
 }

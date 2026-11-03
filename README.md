@@ -43,7 +43,7 @@ Tabbit's sign-in is a `token` cookie: an RS256 JWT issued by
 | Method | What it does |
 |---|---|
 | **Read Tabbit Browser sign-in** (macOS) | Finds the cookie store Tabbit Browser keeps (`~/Library/Application Support/Tabbit Browser/Default/Cookies`), reads the `token` cookie, and decrypts it with the password in the login keychain under `Tabbit Browser Safe Storage`. Nothing is copied by hand; the browser does not have to be closed — the database is copied before it is read. |
-| **Paste Tabbit token** | For anything the first method can't reach (Windows, a browser profile kept somewhere else). In Tabbit Browser, open `web.tabbit.com` and read the `token` cookie from the developer tools; paste it whole. |
+| **Paste Tabbit token** | For anything the first method can't reach (Windows or Linux, a browser profile kept somewhere else). In Tabbit Browser, open `web.tabbit.com` and read the `token` cookie from the developer tools; paste it whole. |
 
 A pasted value may be the bare JWT or a whole `name=value; name=value` cookie
 string. The account id is read out of the token itself, so nothing else has to
@@ -53,9 +53,10 @@ There is no refresh endpoint. When the token runs out (7 days), magpie shows
 the account as needing a sign-in again and the first method takes one more
 click.
 
-> Windows: reading the desktop's cookie needs DPAPI, which this plugin does
-> not do yet. Use the paste method; the plugin says so instead of failing
-> vaguely.
+> **macOS only.** Reading the desktop's cookie is implemented for macOS. On
+> Windows the store is DPAPI-encrypted and on Linux it uses a different store
+> key; neither is done here. On those platforms the method refuses and names
+> the platform, and the paste method is the one to use.
 
 ## Models
 
@@ -144,8 +145,11 @@ POST /api/v3/chat/rooms/<room>/join          → text/event-stream
 
 The stream is written back as OpenAI chunks: `assistant_message_delta` →
 `choices[].delta.content`, `event_message_chunk(thinking)` →
-`reasoning_content`, `run_completed` → `finish_reason`. A run that stops early
-is reported as `finish_reason: "length"` rather than pretending to be whole.
+`reasoning_content`, `run_completed` → `finish_reason: "stop"`. A turn that
+ends without `run_completed` or `run_failed` — the stream cut, the turn timing
+out — comes back as an error event, not as a short answer: an agent would
+otherwise take a half or empty reply as the answer. A turn that times out also
+sends `chat/stop`, so it stops spending the account's allowance.
 
 **Conversation history** lives in the room. Each magpie session is given one
 room (`chat.headers` carries the session id), so a follow-up inside a session
@@ -157,23 +161,26 @@ answers the last question with the earlier turns as context.
 
 `maxConcurrency` is **1**: Tabbit answers one turn at a time.
 
-## Install
+## Working on this package
+
+From a checkout of this source tree, or from the published package:
 
 ```sh
-magpie plugin add ./tabbit_providers       # from this directory
-magpie plugin login tabbit                 # or: pick the provider in the app
+magpie plugin add .        # this checkout; the community list has the package
+magpie plugin login tabbit # or: pick the provider in the app
 magpie provider test tabbit
 magpie models tabbit
 ```
 
-In OpenCode, add the same package under `plugin` and sign in with
-`opencode auth login`.
+In OpenCode, add `@magpie-community/opencode-tabbit-auth` under `plugin` and
+sign in with `opencode auth login`.
 
 ## Development
 
 ```sh
-node --test tests/        # every hook, a synthetic cookie store, recorded SSE
-node scripts/check.mjs    # loads the hooks the way magpie and OpenCode do
+node --test tests/*.test.mjs   # Bun: `bun test`. Every hook, a synthetic
+                               # cookie store, a replayed SSE turn
+node scripts/check.mjs         # loads the hooks the way magpie and OpenCode do
 ```
 
 The tests never touch the network. `tests/plugin.test.mjs` stubs Tabbit's four
