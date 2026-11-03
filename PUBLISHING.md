@@ -41,15 +41,39 @@ publish/
 | GitHub 源码仓库（`github:` 安装） | https://github.com/chary1n/tabbit-providers | ✅ public，topics 含 `magpie-plugin` |
 | 社区仓 PR（进「发现 → 推荐列表」） | https://github.com/magpie-community/plugins/pull/673 | ⏳ open，等 review |
 
-实测踩到的两件事，下次发版直接照做：
+实测结论（我先前写错过一次，这里是更正后的）：
 
-1. **首次发布会先出现 `0.0.0-stage` 占位版本**（npm 的暂存发布流程，占名用）。真实版本批准
-   后会自动替换，`dist-tags.latest` 指向真实版本即可，占位版本留着无害。
-2. **带「bypass 2FA」的 granular token 会被转成 staged**。要直接上线就带 OTP：
-   `npm publish --otp=<6位码>`。如果报
-   `You cannot publish over the previously published versions: X`，
-   说明 X **已经发上去了**——先 `npm view magpie-tabbit-provider version` 确认，
-   真要再发就 bump 版本号。
+1. **带「Bypass 2FA」的 Granular token 发布时不需要 OTP。** 直接 `npm publish` 即可，
+   输出会写 `Your package is being processed and may take a few minutes`，大约 **1 分钟**后
+   `dist-tags.latest` 才会变成新版本。这中间它看着像"没发上去"，其实在传播。
+2. **首次发布会先出现 `0.0.0-stage`**：那是 npm 给新包名的占位版本，用来先占住名字。
+   真实版本随后替换 `latest`，占位版本留着无害，不需要任何人工批准。
+3. 如果报 `You cannot publish over the previously published versions: X`，说明 X 已经在线上，
+   `npm view magpie-tabbit-provider version` 确认一下；要再发就 bump 版本号。
+
+## 自动发布（不用每次给 OTP）
+
+**结论：这台机器上已经可以无 OTP 发布了** —— `~/.npmrc` 里那个 Granular token 勾了
+「Bypass 2FA」，`npm publish` 直接过。所以「不想每次给 6 位码」这件事已经成立。
+
+要做到「连命令都不用敲」，用仓库里的 `.github/workflows/publish.yml`：**推一个版本 tag 就发布**。
+
+```sh
+npm version patch --no-git-tag-version   # 或手改 package.json
+node --test tests/*.test.mjs && node scripts/check.mjs
+git add -A && git commit -m "0.1.2"
+git tag v0.1.2
+git push --follow-tags                   # 触发 Actions，自动 publish（含 provenance）
+```
+
+工作流有两种认证方式，**二选一**：
+
+| 方式 | 一次性设置 | 之后 |
+|---|---|---|
+| **npm Trusted Publishing（推荐，无任何密钥）** | npmjs.com → 该包 → Settings → **Trusted publisher** → GitHub Actions：owner `chary1n`、repo `tabbit-providers`、workflow `publish.yml`（网页上要一次 2FA） | Actions 用 OIDC 发布，**不存 token、不过期** |
+| **NPM_TOKEN secret** | 建一个 Read/Write 的 granular token → 仓库 Settings → Secrets → `NPM_TOKEN` | 工作流的 `NODE_AUTH_TOKEN` 那行取消注释即可 |
+
+Trusted Publishing 的 2FA 只在那一次网页设置时出现，之后每次发版都不再需要任何码。
 
 ## 路线 A：只发 npm（最快，10 分钟）
 

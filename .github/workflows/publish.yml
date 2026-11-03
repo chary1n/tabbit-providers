@@ -1,0 +1,45 @@
+name: publish
+
+# Publishes on a version tag, so a release is `npm version patch && git push
+# --follow-tags` — no one-time code, no token to paste.
+#
+# The no-secret way is npm's Trusted Publishing (OIDC): on npmjs.com, this
+# package's Settings → Trusted publisher → GitHub Actions, with
+#   owner chary1n · repository tabbit-providers · workflow publish.yml
+# After that this workflow authenticates with the OIDC token it is given below
+# (`id-token: write`), and npm records provenance for the tarball.
+#
+# If you would rather not set that up, create an npm "Granular access token"
+# with read/write on this package, add it as the repository secret NPM_TOKEN,
+# and uncomment the NODE_AUTH_TOKEN line under the publish step.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # npm Trusted Publishing (OIDC)
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Test
+        run: node --test tests/*.test.mjs
+
+      - name: Check the hooks load the way magpie and OpenCode load them
+        run: node scripts/check.mjs
+
+      - name: Publish
+        run: npm publish --access public --provenance
+        # env:
+        #   NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
